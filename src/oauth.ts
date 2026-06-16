@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { getMachineId } from "./cosy.js";
 import { interactiveLogin } from "./login.js";
 import { updateQoderModelsCache } from "./models.js";
+import { credentialsFromPat, decodePatRefresh, isPatRefresh } from "./pat.js";
 
 export interface QoderCredentials extends OAuthCredentials {
   userID: string;
@@ -37,46 +38,21 @@ export function getCachedCredentials(_accessToken: string): QoderCredentials | n
 }
 
 export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  // 1. Try environment variables first (PAT)
+  // 1. Try environment variables first (PAT). A PAT (pt-...) must be exchanged
+  //    for a short-lived job token before it can be used — credentialsFromPat
+  //    handles the exchange + identity resolution.
   const pat = process.env.QODER_PERSONAL_ACCESS_TOKEN || process.env.QODER_PAT;
   if (pat) {
     try {
-      const userinfoRes = await fetch("https://openapi.qoder.sh/api/v1/userinfo", {
-        headers: {
-          Authorization: `Bearer ${pat}`,
-          Accept: "application/json",
-          "User-Agent": "pi-provider-qoder",
-        },
-      });
-      if (userinfoRes.ok) {
-        const userinfo = (await userinfoRes.json()) as {
-          id?: string;
-          email?: string;
-          name?: string;
-          username?: string;
-        };
-        const email = userinfo.email || "";
-        const name = userinfo.name || userinfo.username || "";
-        const userID = userinfo.id || "pat";
-        const machineID = getMachineId();
-
-        const creds = {
-          refresh: `pat|${userID}|${machineID}`,
-          access: pat,
-          expires: Date.now() + 30 * 24 * 60 * 60 * 1000, // 30 days
-          userID,
-          email,
-          name,
-          machineID,
-        };
-
-        // pi persists these credentials in auth.json itself; no separate cache needed.
-        // Cache models in background
-        updateQoderModelsCache(pat, userID, name, email).catch(() => {});
-
-        return creds;
-      }
-    } catch {}
+      const creds = await credentialsFromPat(pat);
+      const qCreds = creds as QoderCredentials;
+      // pi persists these credentials in auth.json itself; no separate cache needed.
+      // Cache models in background
+      updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email).catch(() => {});
+      return creds;
+    } catch {
+      // Fall through to interactive login if PAT exchange fails.
+    }
   }
 
   // 2. Interactive login
@@ -92,18 +68,29 @@ export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthC
 }
 
 export async function refreshQoderToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+  // PAT-based credentials: re-exchange the stored PAT for a fresh job token.
+  if (isPatRefresh(credentials.refresh)) {
+    const { pat } = decodePatRefresh(credentials.refresh);
+    if (pat) {
+      try {
+        const refreshed = await credentialsFromPat(pat);
+        const qCreds = refreshed as QoderCredentials;
+        updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email).catch(() => {});
+        return refreshed;
+      } catch {
+        // Fall through to validity extension below.
+      }
+    }
+    return {
+      ...credentials,
+      expires: Date.now() + 60 * 60 * 1000, // extend 1 hour to retry later
+    };
+  }
+
   const parts = credentials.refresh.split("|");
   const refreshToken = parts[0] || "";
   const userID = parts[1] || "";
   const machineID = parts[2] || getMachineId();
-
-  if (refreshToken === "pat") {
-    // PAT tokens don't need refreshing, just extend validity
-    return {
-      ...credentials,
-      expires: Date.now() + 30 * 24 * 60 * 60 * 1000,
-    };
-  }
 
   const refreshURL = "https://center.qoder.sh/algo/api/v3/user/refresh_token";
   try {

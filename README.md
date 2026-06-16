@@ -30,11 +30,25 @@ Then log in from pi:
 /login qoder
 ```
 
-The login flow will prompt you to complete authorization in your browser.
+The login menu offers two methods:
 
-### Personal Access Token (PAT) Fallback
+- **Browser Login** — OAuth device-code flow; complete authorization in your browser.
+- **Use API Key (PAT)** — paste a Qoder Personal Access Token (`pt-...`).
 
-For non-interactive environments, you can set the `QODER_PERSONAL_ACCESS_TOKEN` (or `QODER_PAT`) environment variable before starting pi. The provider will automatically pick up the PAT and authenticate.
+### Personal Access Token (PAT)
+
+A Qoder PAT (`pt-...`) cannot authenticate API calls directly — the provider
+exchanges it for a short-lived job token (mirroring the official `qodercli`
+flow) and resolves your account identity automatically. You can supply a PAT in
+two ways:
+
+- Run `/login qoder` and choose **Use API Key (PAT)**, then paste the token.
+- Set the `QODER_PERSONAL_ACCESS_TOKEN` (or `QODER_PAT`) environment variable,
+  then run `/login qoder` — the PAT is picked up automatically and exchanged
+  without further prompts. This is the recommended path for headless/CI setups.
+
+> The exchanged job token is short-lived; the provider transparently re-exchanges
+> the stored PAT when it expires.
 
 ## Models
 
@@ -70,8 +84,9 @@ Or let Qoder select automatically:
 src/
 ├── index.ts            # Extension registration
 ├── cosy.ts             # COSY Signature and Machine ID resolver
-├── login.ts            # OAuth Device Flow login sequence
+├── login.ts            # OAuth Device Flow + PAT login sequence
 ├── login-ui.ts         # Custom TUI components for login
+├── pat.ts              # PAT → job-token exchange + identity resolution
 ├── models.ts           # Model definitions and Dynamic Config Cache
 ├── oauth.ts            # PAT / OAuth callback orchestrator
 ├── stream.ts           # Main streaming response handler

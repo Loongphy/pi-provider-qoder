@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { getMachineId } from "./cosy.js";
 import { hasExtensionContext, showLoginUI, showWaitingUI } from "./login-ui.js";
+import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 
@@ -43,6 +44,10 @@ export async function interactiveLogin(callbacks: OAuthLoginCallbacks): Promise<
       throw new Error("Login cancelled");
     }
 
+    if (choice.method === "pat") {
+      return patLogin(callbacks);
+    }
+
     const runAuth = async (mergedCallbacks: OAuthLoginCallbacks) => {
       return runDeviceFlow(mergedCallbacks);
     };
@@ -54,16 +59,48 @@ export async function interactiveLogin(callbacks: OAuthLoginCallbacks): Promise<
     return creds;
   }
 
-  // Fallback for terminal prompt
+  // Fallback for terminal prompt (no extension TUI context).
+  // Offer PAT entry first since it works in non-interactive-ish setups.
   const prompt = getPrompt(callbacks);
-  const proceed = await prompt({
+  const pat = await prompt({
+    message: "Paste a Qoder Personal Access Token (pt-...), or leave empty for browser login",
+    placeholder: "pt-...",
+    allowEmpty: true,
+  });
+  if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+  if (pat?.trim()) {
+    return patLogin(callbacks, pat.trim());
+  }
+
+  await prompt({
     message: "Press Enter to start browser login for Qoder",
     placeholder: "press enter",
     allowEmpty: true,
   });
-
   if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
   return runDeviceFlow(callbacks);
+}
+
+/** Prompt for a PAT (if not provided) and exchange it for full credentials. */
+async function patLogin(callbacks: OAuthLoginCallbacks, providedPat?: string): Promise<OAuthCredentials> {
+  let pat = providedPat;
+  if (!pat) {
+    const prompt = getPrompt(callbacks);
+    const entered = await prompt({
+      message: "Paste your Qoder Personal Access Token (pt-...)",
+      placeholder: "pt-...",
+      allowEmpty: false,
+    });
+    if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
+    pat = entered?.trim();
+  }
+  if (!pat) {
+    throw new Error("No Personal Access Token provided");
+  }
+  getProgress(callbacks)?.("Exchanging access token...");
+  const creds = await credentialsFromPat(pat);
+  getProgress(callbacks)?.("Login successful!");
+  return creds;
 }
 
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {

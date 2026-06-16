@@ -2,7 +2,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import { DynamicBorder, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 
-export type LoginChoice = { method: "web" } | null; // cancelled
+export type LoginChoice = { method: "web" } | { method: "pat" } | null; // null = cancelled
 
 let _ctx: ExtensionContext | undefined;
 
@@ -25,6 +25,7 @@ export async function showLoginUI(): Promise<LoginChoice> {
   return ctx.ui.custom<LoginChoice>((tui, theme, _kb, done) => {
     const mainItems: SelectItem[] = [
       { value: "web", label: "Browser Login", description: "Sign in via browser (OAuth device flow)" },
+      { value: "pat", label: "Use API Key (PAT)", description: "Paste a Qoder Personal Access Token (pt-...)" },
     ];
 
     const container = new Container();
@@ -42,7 +43,7 @@ export async function showLoginUI(): Promise<LoginChoice> {
     });
 
     selectList.onSelect = (item) => {
-      done({ method: item.value as "web" });
+      done({ method: item.value as "web" | "pat" });
     };
     selectList.onCancel = () => done(null);
 
