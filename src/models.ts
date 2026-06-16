@@ -45,7 +45,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: true,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -58,7 +58,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: true,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 272000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -97,7 +97,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -110,7 +110,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -123,7 +123,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: true,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -136,7 +136,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: true,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -175,7 +175,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
 ];
@@ -255,7 +255,17 @@ export async function updateQoderModelsCache(
       if (!key || !entry.enable) continue;
 
       const display = entry.display_name || key;
-      const ctxLen = entry.max_input_tokens || 180000;
+      let ctxLen = entry.max_input_tokens || 180000;
+      if (entry.context_config && typeof entry.context_config === "object") {
+        for (const configVal of Object.values(entry.context_config)) {
+          if (configVal && typeof configVal === "object" && typeof (configVal as any).token_count === "number") {
+            const tc = (configVal as any).token_count;
+            if (tc > ctxLen) {
+              ctxLen = tc;
+            }
+          }
+        }
+      }
       const isVL = !!entry.is_vl;
       const isReasoning = !!entry.is_reasoning || !!entry.thinking_config;
       const supportsEffort = !!entry.thinking_config?.enabled?.efforts;
