@@ -85,7 +85,6 @@ src/
 ├── index.ts            # Extension registration
 ├── cosy.ts             # COSY Signature and Machine ID resolver
 ├── login.ts            # OAuth Device Flow + PAT login sequence
-├── login-ui.ts         # Custom TUI components for login
 ├── pat.ts              # PAT → job-token exchange + identity resolution
 ├── models.ts           # Model definitions and Dynamic Config Cache
 ├── oauth.ts            # PAT / OAuth callback orchestrator

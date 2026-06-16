@@ -6,6 +6,9 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  TextContent,
+  ThinkingContent,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import { buildAuthHeaders, getMachineId } from "./cosy.js";
@@ -14,6 +17,15 @@ import { getCachedCredentials } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
+
+interface ToolCallState {
+  arguments: string;
+  id: string;
+  name: string;
+  emittedStart?: boolean;
+  emittedEnd?: boolean;
+  contentIndex: number;
+}
 
 function stableHash(prefix: string, ...inputs: string[]): string {
   const hash = crypto.createHash("sha256");
@@ -25,17 +37,22 @@ function stableHash(prefix: string, ...inputs: string[]): string {
   return hash.digest("hex").slice(0, 16);
 }
 
-function stableChatRecordID(model: string, messages: any[], tools: any, maxTokens: number): string {
+function stableChatRecordID(
+  model: string,
+  messages: Array<{ role?: string; content?: unknown }>,
+  tools: unknown,
+  maxTokens: number,
+): string {
   const hash = crypto.createHash("sha256");
   hash.update("qoder-record");
   hash.update("\0");
   hash.update(model);
   for (const msg of messages) {
-    if (msg && msg.role) {
+    if (msg?.role) {
       hash.update("\0");
       hash.update(msg.role);
     }
-    if (msg && msg.content) {
+    if (msg?.content) {
       hash.update("\0");
       hash.update(typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content));
     }
@@ -124,7 +141,7 @@ export function streamQoder(
             typeof content === "string"
               ? content
               : Array.isArray(content)
-                ? content.map((c) => c.text || "").join("")
+                ? content.map((c) => ("text" in c ? c.text : "")).join("")
                 : "";
           break;
         }
@@ -143,7 +160,7 @@ export function streamQoder(
       const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
 
-      const reqBody: Record<string, any> = {
+      const reqBody: Record<string, unknown> = {
         request_id: crypto.randomUUID(),
         request_set_id: recordID,
         chat_record_id: recordID,
@@ -235,9 +252,9 @@ export function streamQoder(
 
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;
-      const toolCallsState: any[] = [];
+      const toolCallsState: ToolCallState[] = [];
 
-      const thinkingEnabled = (options?.reasoning as any) !== false && (options?.reasoning as any) !== "off";
+      const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
       const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
       stream.push({ type: "start", partial: output });
@@ -281,10 +298,10 @@ export function streamQoder(
                 if (delta.reasoning_content) {
                   if (thinkingBlockIndex === -1) {
                     thinkingBlockIndex = output.content.length;
-                    output.content.push({ type: "thinking", thinking: "" } as any);
+                    output.content.push({ type: "thinking", thinking: "" });
                     stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
                   }
-                  const block = output.content[thinkingBlockIndex] as any;
+                  const block = output.content[thinkingBlockIndex] as ThinkingContent;
                   block.thinking += delta.reasoning_content;
                   stream.push({
                     type: "thinking_delta",
@@ -298,7 +315,7 @@ export function streamQoder(
                 if (delta.content) {
                   // End API thinking block if active
                   if (thinkingBlockIndex !== -1) {
-                    const block = output.content[thinkingBlockIndex] as any;
+                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
                     stream.push({
                       type: "thinking_end",
                       contentIndex: thinkingBlockIndex,
@@ -313,10 +330,10 @@ export function streamQoder(
                   } else {
                     if (contentBlockIndex === -1) {
                       contentBlockIndex = output.content.length;
-                      output.content.push({ type: "text", text: "" } as any);
+                      output.content.push({ type: "text", text: "" });
                       stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
                     }
-                    const block = output.content[contentBlockIndex] as any;
+                    const block = output.content[contentBlockIndex] as TextContent;
                     block.text += delta.content;
                     stream.push({
                       type: "text_delta",
@@ -332,7 +349,7 @@ export function streamQoder(
                   for (const tc of delta.tool_calls) {
                     const idx = tc.index ?? 0;
                     if (!toolCallsState[idx]) {
-                      toolCallsState[idx] = { arguments: "" };
+                      toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
                     }
                     const state = toolCallsState[idx];
                     if (tc.id) state.id = tc.id;
@@ -344,8 +361,8 @@ export function streamQoder(
                       if (state.emittedStart === undefined) {
                         state.emittedStart = true;
                         state.contentIndex = output.content.length;
-                        const block = { type: "toolCall", id: state.id, name: state.name, arguments: {} };
-                        output.content.push(block as any);
+                        const block: ToolCall = { type: "toolCall", id: state.id, name: state.name, arguments: {} };
+                        output.content.push(block);
                         stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
                       }
                       stream.push({
@@ -372,7 +389,7 @@ export function streamQoder(
       }
 
       if (thinkingBlockIndex !== -1) {
-        const block = output.content[thinkingBlockIndex] as any;
+        const block = output.content[thinkingBlockIndex] as ThinkingContent;
         stream.push({
           type: "thinking_end",
           contentIndex: thinkingBlockIndex,
@@ -382,13 +399,13 @@ export function streamQoder(
       }
 
       for (const state of toolCallsState) {
-        if (state && state.emittedStart && !state.emittedEnd) {
+        if (state?.emittedStart && !state.emittedEnd) {
           state.emittedEnd = true;
           let args = {};
           try {
             args = JSON.parse(state.arguments || "{}");
           } catch {}
-          const block = output.content[state.contentIndex] as any;
+          const block = output.content[state.contentIndex] as ToolCall;
           block.arguments = args;
           stream.push({
             type: "toolcall_end",
@@ -411,7 +428,7 @@ export function streamQoder(
       }
       stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
       stream.end();
-    } catch (e: any) {
+    } catch (e: unknown) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       stream.push({ type: "error", reason: output.stopReason, error: output });

@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { getMachineId } from "./cosy.js";
-import { hasExtensionContext, showLoginUI, showWaitingUI } from "./login-ui.js";
 import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
@@ -38,29 +37,10 @@ function parseExpiresAt(s?: string, expiresInSeconds?: number): number {
 }
 
 export async function interactiveLogin(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  if (hasExtensionContext()) {
-    const choice = await showLoginUI();
-    if (!choice) {
-      throw new Error("Login cancelled");
-    }
-
-    if (choice.method === "pat") {
-      return patLogin(callbacks);
-    }
-
-    const runAuth = async (mergedCallbacks: OAuthLoginCallbacks) => {
-      return runDeviceFlow(mergedCallbacks);
-    };
-
-    const creds = await showWaitingUI(callbacks, runAuth);
-    if (!creds) {
-      throw new Error("Login cancelled");
-    }
-    return creds;
-  }
-
-  // Fallback for terminal prompt (no extension TUI context).
-  // Offer PAT entry first since it works in non-interactive-ish setups.
+  // pi drives this via its built-in LoginDialog, which wires onPrompt/onAuth/
+  // onProgress to a focused input. We must use those callbacks directly rather
+  // than opening our own ctx.ui.custom surface (which would steal focus and
+  // leave onPrompt unable to receive keystrokes).
   const prompt = getPrompt(callbacks);
   const pat = await prompt({
     message: "Paste a Qoder Personal Access Token (pt-...), or leave empty for browser login",
@@ -72,11 +52,6 @@ export async function interactiveLogin(callbacks: OAuthLoginCallbacks): Promise<
     return patLogin(callbacks, pat.trim());
   }
 
-  await prompt({
-    message: "Press Enter to start browser login for Qoder",
-    placeholder: "press enter",
-    allowEmpty: true,
-  });
   if (getSignal(callbacks)?.aborted) throw new Error("Login cancelled");
   return runDeviceFlow(callbacks);
 }
@@ -208,9 +183,10 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
         email,
         name,
         machineID,
-      } as any;
-    } catch (e: any) {
-      if (e.name === "AbortError" || getSignal(callbacks)?.aborted) {
+      } as OAuthCredentials;
+    } catch (e: unknown) {
+      const err = e as { name?: string };
+      if (err.name === "AbortError" || getSignal(callbacks)?.aborted) {
         throw new Error("Login cancelled");
       }
       throw e;

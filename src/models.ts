@@ -7,6 +7,21 @@ const CACHE_PATH = join(homedir(), ".pi", "agent", "qoder-models-cache.json");
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
+/** Shape of a single entry returned by the Qoder /model/list endpoint. */
+export interface QoderModelEntry {
+  key?: string;
+  enable?: boolean;
+  display_name?: string;
+  max_input_tokens?: number;
+  max_output_tokens?: number;
+  context_config?: Record<string, { token_count?: number }>;
+  is_vl?: boolean;
+  is_reasoning?: boolean;
+  thinking_config?: { enabled?: { efforts?: unknown } };
+  source?: string;
+  [key: string]: unknown;
+}
+
 export interface QoderModelDef {
   id: string;
   name: string;
@@ -192,12 +207,12 @@ export function getCachedModels(): QoderModelDef[] {
   return staticModels;
 }
 
-export function getCachedModelConfig(modelKey: string): Record<string, any> | null {
+export function getCachedModelConfig(modelKey: string): QoderModelEntry | null {
   if (existsSync(CACHE_PATH)) {
     try {
       const data = JSON.parse(readFileSync(CACHE_PATH, "utf8"));
-      if (data && data.configs && data.configs[modelKey]) {
-        return data.configs[modelKey];
+      if (data?.configs?.[modelKey]) {
+        return data.configs[modelKey] as QoderModelEntry;
       }
     } catch {}
   }
@@ -243,12 +258,12 @@ export async function updateQoderModelsCache(
       return;
     }
 
-    const resData = (await response.json()) as { chat?: any[] };
+    const resData = (await response.json()) as { chat?: QoderModelEntry[] };
     const chatModels = resData.chat || [];
     if (chatModels.length === 0) return;
 
     const newModels: QoderModelDef[] = [];
-    const configs: Record<string, any> = {};
+    const configs: Record<string, QoderModelEntry> = {};
 
     for (const entry of chatModels) {
       const key = entry.key;
@@ -258,8 +273,8 @@ export async function updateQoderModelsCache(
       let ctxLen = entry.max_input_tokens || 180000;
       if (entry.context_config && typeof entry.context_config === "object") {
         for (const configVal of Object.values(entry.context_config)) {
-          if (configVal && typeof configVal === "object" && typeof (configVal as any).token_count === "number") {
-            const tc = (configVal as any).token_count;
+          if (configVal && typeof configVal === "object" && typeof configVal.token_count === "number") {
+            const tc = configVal.token_count;
             if (tc > ctxLen) {
               ctxLen = tc;
             }

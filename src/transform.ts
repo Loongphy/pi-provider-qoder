@@ -9,6 +9,35 @@ import type {
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 
+/** OpenAI-style tool definition sent to the Qoder API. */
+interface QoderTool {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: unknown;
+  };
+}
+
+/** OpenAI-style tool call within an assistant message. */
+interface QoderToolCall {
+  id?: string;
+  type: "function";
+  function: { name?: string; arguments: string };
+}
+
+type QoderTextPart = { type: "text"; text: string };
+type QoderImagePart = { type: "image_url"; image_url: { url: string } };
+type QoderContent = string | Array<QoderTextPart | QoderImagePart>;
+
+/** OpenAI-style message sent to the Qoder API. */
+interface QoderMessage {
+  role: "user" | "assistant" | "tool";
+  content: QoderContent | null;
+  tool_calls?: QoderToolCall[];
+  tool_call_id?: string;
+}
+
 export function getContentText(msg: Message): string {
   if (typeof msg.content === "string") return msg.content;
   if (Array.isArray(msg.content)) {
@@ -23,7 +52,7 @@ export function getContentText(msg: Message): string {
   return "";
 }
 
-export function transformTools(tools: Tool[]): any[] {
+export function transformTools(tools: Tool[]): QoderTool[] {
   return tools.map((t) => ({
     type: "function",
     function: {
@@ -34,8 +63,8 @@ export function transformTools(tools: Tool[]): any[] {
   }));
 }
 
-export function transformMessagesForQoder(messages: Message[]): any[] {
-  const normalizedMessages: any[] = [];
+export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
+  const normalizedMessages: QoderMessage[] = [];
 
   for (const msg of messages) {
     // Skip error or aborted messages
@@ -47,14 +76,14 @@ export function transformMessagesForQoder(messages: Message[]): any[] {
     }
 
     if (msg.role === "user") {
-      let content: any = "";
+      let content: QoderContent = "";
       if (typeof msg.content === "string") {
         content = msg.content;
       } else if (Array.isArray(msg.content)) {
         const hasImage = msg.content.some((c) => c.type === "image");
         if (hasImage) {
           content = msg.content
-            .map((c) => {
+            .map((c): QoderTextPart | QoderImagePart | null => {
               if (c.type === "text") {
                 return { type: "text", text: (c as TextContent).text };
               }
@@ -69,7 +98,7 @@ export function transformMessagesForQoder(messages: Message[]): any[] {
               }
               return null;
             })
-            .filter(Boolean);
+            .filter((p): p is QoderTextPart | QoderImagePart => p !== null);
         } else {
           content = getContentText(msg);
         }
@@ -81,7 +110,7 @@ export function transformMessagesForQoder(messages: Message[]): any[] {
     } else if (msg.role === "assistant") {
       const am = msg as AssistantMessage;
       let content = "";
-      const toolCalls: any[] = [];
+      const toolCalls: QoderToolCall[] = [];
 
       if (Array.isArray(am.content)) {
         for (const block of am.content) {
@@ -106,7 +135,7 @@ export function transformMessagesForQoder(messages: Message[]): any[] {
         content = am.content || "";
       }
 
-      const mapped: any = {
+      const mapped: QoderMessage = {
         role: "assistant",
         content: content || null,
       };

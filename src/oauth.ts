@@ -29,7 +29,7 @@ export function getCachedCredentials(_accessToken: string): QoderCredentials | n
     try {
       const auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
       const creds = auth?.qoder;
-      if (creds && creds.userID) {
+      if (creds?.userID) {
         return creds as QoderCredentials;
       }
     } catch {}
@@ -91,6 +91,9 @@ export async function refreshQoderToken(credentials: OAuthCredentials): Promise<
   const refreshToken = parts[0] || "";
   const userID = parts[1] || "";
   const machineID = parts[2] || getMachineId();
+  const prev = credentials as Partial<QoderCredentials>;
+  const prevName = prev.name || "";
+  const prevEmail = prev.email || "";
 
   const refreshURL = "https://center.qoder.sh/algo/api/v3/user/refresh_token";
   try {
@@ -130,19 +133,14 @@ export async function refreshQoderToken(credentials: OAuthCredentials): Promise<
         access: newAccess,
         expires: expireMs - 5 * 60 * 1000,
         userID,
-        email: (credentials as any).email || "",
-        name: (credentials as any).name || "",
+        email: prevEmail,
+        name: prevName,
         machineID,
       };
 
       // pi persists the refreshed credentials in auth.json itself.
       // Cache models in background
-      updateQoderModelsCache(
-        newAccess,
-        userID,
-        (credentials as any).name || "",
-        (credentials as any).email || "",
-      ).catch(() => {});
+      updateQoderModelsCache(newAccess, userID, prevName, prevEmail).catch(() => {});
 
       return refreshed;
     }
