@@ -1,7 +1,7 @@
 import type { Api, Model, OAuthCredentials } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
-import { getCachedModels, staticModels } from "./models.js";
-import { loginQoder, refreshQoderToken } from "./oauth.js";
+import { getCachedModels, isCacheStale, staticModels, updateQoderModelsCache } from "./models.js";
+import { getCachedCredentials, loginQoder, refreshQoderToken } from "./oauth.js";
 import { streamQoder } from "./stream.js";
 import { fetchQoderUsage } from "./usage.js";
 
@@ -12,6 +12,24 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
 };
 
 export default function (pi: ExtensionAPI) {
+  // Refresh the models cache once per session at startup if it is missing or
+  // stale (>1h old), rather than on every message in the stream hot path.
+  // Login/refresh are the other rebuild triggers; this covers the case where
+  // the cache was deleted while the token is still valid.
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      const accessToken = await ctx.modelRegistry.getApiKeyForProvider("qoder");
+      if (!accessToken || !isCacheStale()) return;
+      const creds = getCachedCredentials(accessToken);
+      const userID = creds?.userID || "qoder-user";
+      const name = creds?.name || "Qoder User";
+      const email = creds?.email || "user@qoder.com";
+      await updateQoderModelsCache(accessToken, userID, name, email);
+    } catch {
+      // Best-effort: fall back to the existing cache / static models.
+    }
+  });
+
   const oauth: OAuthConfigWithUsage = {
     name: "Qoder (Browser OAuth / PAT)",
     login: loginQoder,

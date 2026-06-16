@@ -12,7 +12,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import { buildAuthHeaders, getMachineId } from "./cosy.js";
-import { getCachedModelConfig, isCacheStale, updateQoderModelsCache } from "./models.js";
+import { getCachedModelConfig } from "./models.js";
 import { getCachedCredentials } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
@@ -106,13 +106,6 @@ export function streamQoder(
       const name = cachedCreds?.name || "Qoder User";
       const email = cachedCreds?.email || "user@qoder.com";
       const machineID = cachedCreds?.machineID || getMachineId();
-
-      // Passively rebuild the models cache if it's missing or stale.
-      // Login/refresh are the only other rebuild triggers, so without this a
-      // deleted cache file never gets recreated while the token stays valid.
-      if (isCacheStale()) {
-        updateQoderModelsCache(accessToken, userID, name, email).catch(() => {});
-      }
 
       const qoderModel = model.id;
       const modelConfig = getCachedModelConfig(qoderModel) || {
