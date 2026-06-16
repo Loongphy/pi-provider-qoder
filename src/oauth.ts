@@ -13,20 +13,22 @@ export interface QoderCredentials extends OAuthCredentials {
   machineID: string;
 }
 
-const CREDENTIALS_CACHE_FILE = join(homedir(), ".pi", "agent", "qoder-credentials-cache.json");
+const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 
-export function saveCachedCredentials(creds: QoderCredentials) {
-  try {
-    mkdirSync(dirname(CREDENTIALS_CACHE_FILE), { recursive: true });
-    writeFileSync(CREDENTIALS_CACHE_FILE, JSON.stringify(creds, null, 2), "utf-8");
-  } catch {}
-}
-
-export function getCachedCredentials(accessToken: string): QoderCredentials | null {
-  if (existsSync(CREDENTIALS_CACHE_FILE)) {
+/**
+ * Read the Qoder identity (userID/email/name/machineID) from pi's own auth
+ * store. pi persists the full OAuthCredentials there on login/refresh and keeps
+ * it up to date, so there is no need to maintain a separate credentials cache.
+ *
+ * Note: the auth.json path/shape is a pi internal convention, not a public API.
+ * This is best-effort and falls back to null so callers can use placeholders.
+ */
+export function getCachedCredentials(_accessToken: string): QoderCredentials | null {
+  if (existsSync(AUTH_FILE)) {
     try {
-      const creds = JSON.parse(readFileSync(CREDENTIALS_CACHE_FILE, "utf-8"));
-      if (creds && creds.access === accessToken) {
+      const auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
+      const creds = auth?.qoder;
+      if (creds && creds.userID) {
         return creds as QoderCredentials;
       }
     } catch {}
@@ -68,7 +70,7 @@ export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthC
           machineID,
         };
 
-        saveCachedCredentials(creds);
+        // pi persists these credentials in auth.json itself; no separate cache needed.
         // Cache models in background
         updateQoderModelsCache(pat, userID, name, email).catch(() => {});
 
@@ -80,10 +82,9 @@ export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthC
   // 2. Interactive login
   const creds = await interactiveLogin(callbacks);
 
-  // Cache models in background and save credentials
+  // Cache models in background. pi persists the credentials in auth.json itself.
   try {
     const qCreds = creds as QoderCredentials;
-    saveCachedCredentials(qCreds);
     updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email).catch(() => {});
   } catch {}
 
@@ -147,7 +148,7 @@ export async function refreshQoderToken(credentials: OAuthCredentials): Promise<
         machineID,
       };
 
-      saveCachedCredentials(refreshed as QoderCredentials);
+      // pi persists the refreshed credentials in auth.json itself.
       // Cache models in background
       updateQoderModelsCache(
         newAccess,
@@ -165,8 +166,5 @@ export async function refreshQoderToken(credentials: OAuthCredentials): Promise<
     ...credentials,
     expires: Date.now() + 60 * 60 * 1000, // extend for 1 hour
   };
-  try {
-    saveCachedCredentials(refreshedFallback as QoderCredentials);
-  } catch {}
   return refreshedFallback;
 }

@@ -32,15 +32,12 @@
       "./dist/index.js"
     ]
   },
-  "dependencies": {
-    "esbuild": "^0.25.0",
-    "js-tiktoken": "^1.0.21"
-  },
   "devDependencies": {
     "@biomejs/biome": "2.4.2",
     "@earendil-works/pi-ai": "^0.75.5",
     "@earendil-works/pi-coding-agent": "^0.75.5",
     "@earendil-works/pi-tui": "^0.75.5",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   }
 }
