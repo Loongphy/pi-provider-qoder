@@ -10,7 +10,7 @@ import {
   refreshQoderToken,
   refreshQoderTokenCN,
 } from "./oauth.js";
-import { streamQoder } from "./stream.js";
+import { setQoderUI, streamQoder } from "./stream.js";
 import { fetchQoderUsage, fetchQoderUsageCN } from "./usage.js";
 
 // pi supports a `fetchUsage` hook on the oauth config at runtime, but it is not
@@ -89,6 +89,9 @@ export default async function (pi: ExtensionAPI) {
   // Login/refresh are the other rebuild triggers; this covers the case where
   // the cache was deleted while the token is still valid.
   pi.on("session_start", async (_event, ctx) => {
+    // Capture the extension UI context so the streaming layer can surface
+    // queue/retry status in the interactive working row.
+    setQoderUI(ctx.ui);
     for (const [providerID, mode] of [
       ["qoder", getQoderMode()],
       ["qoder-cn", "cn"],

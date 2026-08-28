@@ -8,7 +8,7 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { streamQoder } from "../stream.js";
+import { setQoderUI, streamQoder } from "../stream.js";
 
 /**
  * Build a single SSE `data:` line carrying a Qoder envelope:
@@ -108,6 +108,7 @@ describe("streamQoder", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
+    setQoderUI(undefined);
   });
 
   it("parses a successful SSE stream into text + stop", async () => {
@@ -289,5 +290,85 @@ describe("streamQoder", () => {
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
     expect(msg.stopReason).toBe("stop");
+  });
+
+  /**
+   * Return a fresh Response for each call, cycling through `bodies` in order
+   * (the last body is reused for any extra calls). Each Response body is a
+   * one-shot stream, so a new instance is required per invocation.
+   */
+  function mockFetchSequence(bodies: string[]): typeof fetch {
+    let call = 0;
+    return vi.fn(async () => {
+      const body = bodies[Math.min(call, bodies.length - 1)];
+      call++;
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as unknown as typeof fetch;
+  }
+
+  /**
+   * Build an SSE envelope carrying Qoder's triple-nested "queued" 403 notice:
+   *   body = {"code":"403","message":"{\"code\":\"10605\",\"message\":\"<inner>\"}"}
+   */
+  function queueEnvelope(inner: object): string {
+    const mid = { code: "10605", message: JSON.stringify(inner) };
+    const outer = { code: "403", message: JSON.stringify(mid) };
+    return sseEnvelope(outer, 403, "Forbidden");
+  }
+
+  // retryAfterSeconds: 0 keeps the test fast (sleepMs resolves immediately).
+  const QUEUED_SSE = queueEnvelope({
+    isQueued: true,
+    modelKey: "qmodel_preview",
+    queueCount: 489,
+    queueType: "slow",
+    retryAfterSeconds: 0,
+    serviceAvailable: true,
+    waitTime: 1401187,
+  });
+
+  it("retries when upstream returns a queued 403, then succeeds", async () => {
+    const fetchMock = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+    globalThis.fetch = fetchMock;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event after queue retry").toBeDefined();
+    const msg = (done as { message: AssistantMessage }).message;
+    expect(msg.stopReason).toBe("stop");
+    const text = msg.content.find((c) => c.type === "text");
+    expect(text && "text" in text ? text.text : "").toBe("OK");
+    // First call hit the queue notice, second call served the real stream.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports queue status via setWorkingMessage and clears it on success", async () => {
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    await consume(stream);
+
+    const messages = setWorkingMessage.mock.calls.map((c) => c[0]);
+    expect(messages.some((m) => typeof m === "string" && m.includes("Queued on qmodel_preview"))).toBe(true);
+    expect(messages.some((m) => typeof m === "string" && m.includes("position 489"))).toBe(true);
+    // The final call restores the default working message (undefined).
+    expect(messages[messages.length - 1]).toBeUndefined();
+  });
+
+  it("still errors on a non-queue 403 (no retry)", async () => {
+    const forbidden = sseEnvelope({ code: "403", message: "forbidden" }, 403, "Forbidden");
+    const fetchMock = mockFetch(forbidden);
+    globalThis.fetch = fetchMock;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event for non-queue 403").toBeDefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

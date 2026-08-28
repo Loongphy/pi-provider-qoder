@@ -74,6 +74,114 @@ function stableChatRecordID(
   return hash.digest("hex").slice(0, 16);
 }
 
+/**
+ * Minimal structural view of the pi extension UI context. We only rely on
+ * `setWorkingMessage`, which lets a provider surface transient status text in
+ * the interactive working/loading row during streaming. Declared structurally
+ * (rather than importing the full ExtensionUIContext) so the stream module does
+ * not need a hard dependency on the coding-agent extension types.
+ */
+interface QoderWorkingUI {
+  setWorkingMessage?(message?: string): void;
+}
+
+let qoderUI: QoderWorkingUI | undefined;
+
+/** Capture the extension UI context (called from the session_start handler). */
+export function setQoderUI(ui: QoderWorkingUI | undefined): void {
+  qoderUI = ui;
+}
+
+/** Maximum number of times we re-submit while the upstream keeps us queued. */
+const QODER_MAX_QUEUE_RETRIES = 60;
+
+interface QoderQueueInfo {
+  isQueued?: boolean;
+  modelKey?: string;
+  queueCount?: number;
+  queueType?: string;
+  retryAfterSeconds?: number;
+  serviceAvailable?: boolean;
+  waitTime?: number;
+}
+
+/**
+ * Qoder signals "you are queued" as a non-200 SSE envelope whose body is a
+ * triple-nested JSON string:
+ *
+ *   {"code":"403","message":"{\"code\":\"10605\",\"message\":\"{...isQueued...}\"}"}
+ *
+ * Returns the parsed queue info when the envelope is a genuine queue notice,
+ * otherwise null (so unrelated errors keep their original behavior).
+ */
+function parseQoderQueueInfo(bodyStr: string): QoderQueueInfo | null {
+  try {
+    const outer = JSON.parse(bodyStr) as { code?: string | number; message?: string };
+    if (String(outer.code) !== "403") return null;
+    const mid = JSON.parse(outer.message ?? "") as { code?: string | number; message?: string };
+    if (String(mid.code) !== "10605") return null;
+    const inner = JSON.parse(mid.message ?? "") as QoderQueueInfo;
+    return inner?.isQueued ? inner : null;
+  } catch {
+    return null;
+  }
+}
+
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason || new Error("Aborted"));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason || new Error("Aborted"));
+      },
+      { once: true },
+    );
+  });
+}
+
+function formatQoderDuration(totalSeconds: number): string {
+  const sec = Math.max(0, Math.round(totalSeconds));
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return s ? `${m}m${s}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm ? `${h}h${mm}m` : `${h}h`;
+}
+
+/**
+ * Report queue status both to stderr (for logs / non-TUI modes) and to the pi
+ * interactive working row via setWorkingMessage.
+ */
+function reportQoderQueueStatus(queueInfo: QoderQueueInfo, attempt: number, maxRetries: number): void {
+  const waitSec = queueInfo.retryAfterSeconds ?? 30;
+  const estSec = Math.round((queueInfo.waitTime || 0) / 1000);
+  const parts: string[] = [`Queued on ${queueInfo.modelKey || "model"}`];
+  if (queueInfo.queueCount != null) parts.push(`position ${queueInfo.queueCount}`);
+  if (queueInfo.queueType) parts.push(`${queueInfo.queueType} queue`);
+  if (estSec > 0) parts.push(`est. wait ~${formatQoderDuration(estSec)}`);
+  parts.push(`retry in ${waitSec}s (${attempt}/${maxRetries})`);
+  const msg = parts.join(" \u00B7 ");
+  console.error(`[pi-provider-qoder] ${msg}`);
+  try {
+    qoderUI?.setWorkingMessage?.(`\u23F3 ${msg}`);
+  } catch {}
+}
+
+/** Restore the default working message once we are no longer queued. */
+function clearQoderQueueStatus(): void {
+  try {
+    qoderUI?.setWorkingMessage?.(undefined);
+  } catch {}
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: Context,
@@ -273,31 +381,14 @@ export function streamQoder(
 
       const modelSource = modelConfig.source || "system";
 
-      const response = await fetch(chatURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": qoderModel,
-          "X-Model-Source": modelSource,
-          ...headers,
-        },
-        body: encodedBytes,
-        signal: options?.signal,
-      });
+      // The stream "start" event is emitted lazily on the first real data
+      // envelope so that queue retries (which re-issue the request before any
+      // content is produced) do not emit a premature start.
+      let streamStarted = false;
+      let queueRetries = 0;
+      let retryQueued = false;
 
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No response body");
       const decoder = new TextDecoder();
-      let buffer = "";
-
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;
       const toolCallsState: ToolCallState[] = [];
@@ -305,206 +396,253 @@ export function streamQoder(
       const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
       const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
-      stream.push({ type: "start", partial: output });
+      do {
+        retryQueued = false;
+        const response = await fetch(chatURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": qoderModel,
+            "X-Model-Source": modelSource,
+            ...headers,
+          },
+          body: encodedBytes,
+          signal: options?.signal,
+        });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+        }
 
-        buffer += decoder.decode(value, { stream: true });
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("No response body");
+        let buffer = "";
 
         while (true) {
-          const lineEnd = buffer.indexOf("\n");
-          if (lineEnd === -1) break;
+          const { done, value } = await reader.read();
+          if (done) break;
 
-          const line = buffer.substring(0, lineEnd).trim();
-          buffer = buffer.substring(lineEnd + 1);
+          buffer += decoder.decode(value, { stream: true });
 
-          if (!line.startsWith("data:")) continue;
+          while (true) {
+            const lineEnd = buffer.indexOf("\n");
+            if (lineEnd === -1) break;
 
-          const dataStr = line.substring(5).trim();
-          if (dataStr === "[DONE]") {
-            break;
-          }
+            const line = buffer.substring(0, lineEnd).trim();
+            buffer = buffer.substring(lineEnd + 1);
 
-          try {
-            const envelope = JSON.parse(dataStr);
-            if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+            if (!line.startsWith("data:")) continue;
+
+            const dataStr = line.substring(5).trim();
+            if (dataStr === "[DONE]") {
+              break;
             }
 
-            const innerStr = envelope.body;
-            if (!innerStr || innerStr === "[DONE]") continue;
+            try {
+              const envelope = JSON.parse(dataStr);
+              if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                // Qoder returns a 403 "queued" notice when the upstream model is
+                // saturated. If we have not produced any content yet, wait the
+                // advertised retry interval and re-submit instead of failing.
+                const queueInfo = parseQoderQueueInfo(envelope.body);
+                if (
+                  queueInfo &&
+                  contentBlockIndex === -1 &&
+                  thinkingBlockIndex === -1 &&
+                  queueRetries < QODER_MAX_QUEUE_RETRIES
+                ) {
+                  queueRetries++;
+                  reportQoderQueueStatus(queueInfo, queueRetries, QODER_MAX_QUEUE_RETRIES);
+                  await sleepMs((queueInfo.retryAfterSeconds ?? 30) * 1000, options?.signal);
+                  retryQueued = true;
+                  break;
+                }
+                throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+              }
 
-            const inner = JSON.parse(innerStr);
-            if (inner.id) output.responseId = inner.id as string;
-            if (inner.model) output.responseModel = inner.model as string;
-            if (inner.usage) {
-              const u = inner.usage as {
-                prompt_tokens?: number;
-                completion_tokens?: number;
-                total_tokens?: number;
-                completion_tokens_details?: { reasoning_tokens?: number };
-                prompt_tokens_details?: {
-                  cacheable_tokens?: number;
-                  cached_tokens?: number;
-                  cache_write_tokens?: number;
+              if (!streamStarted) {
+                streamStarted = true;
+                clearQoderQueueStatus();
+                stream.push({ type: "start", partial: output });
+              }
+
+              const innerStr = envelope.body;
+              if (!innerStr || innerStr === "[DONE]") continue;
+
+              const inner = JSON.parse(innerStr);
+              if (inner.id) output.responseId = inner.id as string;
+              if (inner.model) output.responseModel = inner.model as string;
+              if (inner.usage) {
+                const u = inner.usage as {
+                  prompt_tokens?: number;
+                  completion_tokens?: number;
+                  total_tokens?: number;
+                  completion_tokens_details?: { reasoning_tokens?: number };
+                  prompt_tokens_details?: {
+                    cacheable_tokens?: number;
+                    cached_tokens?: number;
+                    cache_write_tokens?: number;
+                  };
                 };
-              };
-              // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
-              // (Anthropic convention: `input` EXCLUDES cached/written tokens).
-              // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
-              // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
-              // when reported) to match the contract pi-ai's own OpenAI
-              // provider uses. `cacheable_tokens` is a capacity metric, not a
-              // write count (it is 0 even on first-turn writes), so it is NOT
-              // mapped to cacheWrite.
-              const promptTokens = u.prompt_tokens ?? 0;
-              const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
-              const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
-              output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-              output.usage.output = u.completion_tokens ?? 0;
-              output.usage.totalTokens = u.total_tokens ?? 0;
-              output.usage.cacheRead = cacheReadTokens;
-              output.usage.cacheWrite = cacheWriteTokens;
-            }
-            if (inner.choices && inner.choices.length > 0) {
-              const choice = inner.choices[0];
-              const delta = choice.delta;
+                // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
+                // (Anthropic convention: `input` EXCLUDES cached/written tokens).
+                // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
+                // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
+                // when reported) to match the contract pi-ai's own OpenAI
+                // provider uses. `cacheable_tokens` is a capacity metric, not a
+                // write count (it is 0 even on first-turn writes), so it is NOT
+                // mapped to cacheWrite.
+                const promptTokens = u.prompt_tokens ?? 0;
+                const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+                const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
+                output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+                output.usage.output = u.completion_tokens ?? 0;
+                output.usage.totalTokens = u.total_tokens ?? 0;
+                output.usage.cacheRead = cacheReadTokens;
+                output.usage.cacheWrite = cacheWriteTokens;
+              }
+              if (inner.choices && inner.choices.length > 0) {
+                const choice = inner.choices[0];
+                const delta = choice.delta;
 
-              if (delta) {
-                // 1. Process reasoning/thinking content (API reasoning)
-                if (delta.reasoning_content) {
-                  // Qoder's backend sometimes routes a literal `<thinking>`
-                  // opener into reasoning_content (with the matching
-                  // `</thinking>` closer landing in the content stream). Strip
-                  // tag artifacts so the thinking block stays clean, matching
-                  // the SDK's ContentBlock model.
-                  const reasoningChunk = stripThinkingTags(delta.reasoning_content);
-                  if (reasoningChunk) {
-                    if (thinkingBlockIndex === -1) {
-                      thinkingBlockIndex = output.content.length;
-                      output.content.push({ type: "thinking", thinking: "" });
-                      stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
-                    }
-                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                    block.thinking += reasoningChunk;
-                    stream.push({
-                      type: "thinking_delta",
-                      contentIndex: thinkingBlockIndex,
-                      delta: reasoningChunk,
-                      partial: output,
-                    });
-                  }
-                }
-
-                // 2. Process text content
-                if (delta.content) {
-                  // End API thinking block if active
-                  if (thinkingBlockIndex !== -1) {
-                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                    stream.push({
-                      type: "thinking_end",
-                      contentIndex: thinkingBlockIndex,
-                      content: block.thinking,
-                      partial: output,
-                    });
-                    thinkingBlockIndex = -1;
-                  }
-
-                  if (thinkingParser) {
-                    thinkingParser.processChunk(delta.content);
-                  } else {
-                    if (contentBlockIndex === -1) {
-                      contentBlockIndex = output.content.length;
-                      output.content.push({ type: "text", text: "" });
-                      stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                    }
-                    const block = output.content[contentBlockIndex] as TextContent;
-                    block.text += delta.content;
-                    stream.push({
-                      type: "text_delta",
-                      contentIndex: contentBlockIndex,
-                      delta: delta.content,
-                      partial: output,
-                    });
-                  }
-                }
-
-                // 3. Process tool calls
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = tc.index ?? 0;
-                    if (!toolCallsState[idx]) {
-                      toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
-                    }
-                    const state = toolCallsState[idx];
-                    if (tc.id) state.id = tc.id;
-                    if (tc.function?.name) state.name = tc.function.name;
-
-                    // Open the block as soon as the call is IDENTIFIABLE, not
-                    // when its first argument byte arrives. A call whose
-                    // arguments are absent or an empty string — a no-argument
-                    // tool, or a model that sends id+name and then stops — used
-                    // to create a toolCallsState entry and no content block, so
-                    // the finalizer below saw a non-empty state array, set
-                    // stopReason "toolUse", and handed back a message with no
-                    // tool call in it. The agent loop then had nothing to run
-                    // and the turn simply ended, mid-task and without an error.
-                    if (state.emittedStart === undefined && (state.id || state.name)) {
-                      state.emittedStart = true;
-                      state.contentIndex = output.content.length;
-                      output.content.push({
-                        type: "toolCall",
-                        id: state.id,
-                        name: state.name,
-                        arguments: {},
-                      } satisfies ToolCall);
-                      stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
-                    }
-
-                    // id and name can arrive after the block is open; keep it
-                    // in step, since the finalizer only rewrites `arguments`.
-                    if (state.emittedStart) {
-                      const block = output.content[state.contentIndex] as ToolCall;
-                      block.id = state.id;
-                      block.name = state.name;
-                    }
-
-                    if (tc.function?.arguments) {
-                      const argDelta = tc.function.arguments;
-                      state.arguments += argDelta;
+                if (delta) {
+                  // 1. Process reasoning/thinking content (API reasoning)
+                  if (delta.reasoning_content) {
+                    // Qoder's backend sometimes routes a literal `<thinking>`
+                    // opener into reasoning_content (with the matching
+                    // `</thinking>` closer landing in the content stream). Strip
+                    // tag artifacts so the thinking block stays clean, matching
+                    // the SDK's ContentBlock model.
+                    const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+                    if (reasoningChunk) {
+                      if (thinkingBlockIndex === -1) {
+                        thinkingBlockIndex = output.content.length;
+                        output.content.push({ type: "thinking", thinking: "" });
+                        stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+                      }
+                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                      block.thinking += reasoningChunk;
                       stream.push({
-                        type: "toolcall_delta",
-                        contentIndex: state.contentIndex,
-                        delta: argDelta,
+                        type: "thinking_delta",
+                        contentIndex: thinkingBlockIndex,
+                        delta: reasoningChunk,
                         partial: output,
                       });
                     }
                   }
+
+                  // 2. Process text content
+                  if (delta.content) {
+                    // End API thinking block if active
+                    if (thinkingBlockIndex !== -1) {
+                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                      stream.push({
+                        type: "thinking_end",
+                        contentIndex: thinkingBlockIndex,
+                        content: block.thinking,
+                        partial: output,
+                      });
+                      thinkingBlockIndex = -1;
+                    }
+
+                    if (thinkingParser) {
+                      thinkingParser.processChunk(delta.content);
+                    } else {
+                      if (contentBlockIndex === -1) {
+                        contentBlockIndex = output.content.length;
+                        output.content.push({ type: "text", text: "" });
+                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+                      }
+                      const block = output.content[contentBlockIndex] as TextContent;
+                      block.text += delta.content;
+                      stream.push({
+                        type: "text_delta",
+                        contentIndex: contentBlockIndex,
+                        delta: delta.content,
+                        partial: output,
+                      });
+                    }
+                  }
+
+                  // 3. Process tool calls
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                      const idx = tc.index ?? 0;
+                      if (!toolCallsState[idx]) {
+                        toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                      }
+                      const state = toolCallsState[idx];
+                      if (tc.id) state.id = tc.id;
+                      if (tc.function?.name) state.name = tc.function.name;
+
+                      // Open the block as soon as the call is IDENTIFIABLE, not
+                      // when its first argument byte arrives. A call whose
+                      // arguments are absent or an empty string — a no-argument
+                      // tool, or a model that sends id+name and then stops — used
+                      // to create a toolCallsState entry and no content block, so
+                      // the finalizer below saw a non-empty state array, set
+                      // stopReason "toolUse", and handed back a message with no
+                      // tool call in it. The agent loop then had nothing to run
+                      // and the turn simply ended, mid-task and without an error.
+                      if (state.emittedStart === undefined && (state.id || state.name)) {
+                        state.emittedStart = true;
+                        state.contentIndex = output.content.length;
+                        output.content.push({
+                          type: "toolCall",
+                          id: state.id,
+                          name: state.name,
+                          arguments: {},
+                        } satisfies ToolCall);
+                        stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                      }
+
+                      // id and name can arrive after the block is open; keep it
+                      // in step, since the finalizer only rewrites `arguments`.
+                      if (state.emittedStart) {
+                        const block = output.content[state.contentIndex] as ToolCall;
+                        block.id = state.id;
+                        block.name = state.name;
+                      }
+
+                      if (tc.function?.arguments) {
+                        const argDelta = tc.function.arguments;
+                        state.arguments += argDelta;
+                        stream.push({
+                          type: "toolcall_delta",
+                          contentIndex: state.contentIndex,
+                          delta: argDelta,
+                          partial: output,
+                        });
+                      }
+                    }
+                  }
+                }
+
+                if (choice.finish_reason) {
+                  // Preserve the real upstream finish_reason (e.g. "length",
+                  // "content_filter") instead of forcing "stop" later.
+                  output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
                 }
               }
-
-              if (choice.finish_reason) {
-                // Preserve the real upstream finish_reason (e.g. "length",
-                // "content_filter") instead of forcing "stop" later.
-                output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
+            } catch (e) {
+              // A single malformed SSE line shouldn't kill the stream — skip it.
+              // But a genuine upstream error (thrown below) must propagate to the
+              // outer catch and surface as stopReason="error", not be swallowed.
+              if (e instanceof SyntaxError) {
+                if (process.env.QODER_DEBUG) {
+                  console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
+                }
+                continue;
               }
+              throw e;
             }
-          } catch (e) {
-            // A single malformed SSE line shouldn't kill the stream — skip it.
-            // But a genuine upstream error (thrown below) must propagate to the
-            // outer catch and surface as stopReason="error", not be swallowed.
-            if (e instanceof SyntaxError) {
-              if (process.env.QODER_DEBUG) {
-                console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
-              }
-              continue;
-            }
-            throw e;
           }
         }
-      }
+      } while (retryQueued);
 
       if (thinkingParser) {
         thinkingParser.finalize();
