@@ -1,171 +1,75 @@
 # pi-provider-qoder
 
-A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the **Qoder API**, exposing Qoder Global and Qoder China models through provider surfaces.
+让 [pi](https://pi.dev/) 接入 **Qoder API** 的 provider 扩展，通过 Qoder 全球站与 Qoder 中国站提供模型。
 
-## Features
+## 功能
 
-- **Two provider entries**:
-  - `qoder` — Global / international Qoder.
-  - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
-- **Interactive Login**: Global Qoder supports browser device-code flow or Personal Access Token (PAT) login.
-- **Qoder CN PAT Login**: China edition uses a separate PAT login entry (`/login qoder-cn`) and CN token exchange endpoints.
-- **WAF Bypass**: Built-in WAF obfuscation and body encoding (`Encode=1`).
-- **COSY Signing**: Full COSY signature header generation (RSA/AES-CBC/MD5).
-- **Dynamic Model Catalog**: Dynamically fetches model limits, effort configurations, and options from the `/algo/api/v2/model/list` endpoint.
-- **Reasoning/Thinking Support**: Real-time extraction of thinking process from API reasoning or HTML-like `<think>` tags.
+> [!NOTE]
+> `qoder`（国际版）不做主动维护，只定期同步上游；本仓库的改动集中在 `qoder-cn`（中国版）。
 
-## Quick start
+- **双 provider 入口**：`qoder`（全球站）与 `qoder-cn`（中国站，强制走 CN 端点，独立于 `QODER_REGION`）。
+- **登录**：全球站支持浏览器设备码登录或 Personal Access Token（PAT）；中国站走独立 PAT 登录（`/login qoder-cn`）。PAT 会被兑换为短期 job token，过期后自动重新兑换。
+- **动态模型列表**：从上游 `/model/list` 拉取并缓存模型、上下文、推理档位等配置，picker 直接显示上游 `display_name`，型号重命名/升级后自动跟随，无需维护映射表。
+- **推理等级回传**：把 pi 的 thinking level 映射为 Qoder 的 `reasoning_effort` + `enable_thinking` 一并发送，picker 显示的档位与上游实际支持的保持一致。
+- **输出上限 128K**：对齐阿里云百炼官方 Max Output Length（131072），思考模式下不截断思维链。
+- **上下文自适应**：从 `context_config` 取最大可选档（如 1M），无配置时回退 200K。
+- **签名与 WAF 绕过**：内置 COSY 签名头生成（RSA/AES-CBC/MD5）与 WAF body 编码（`Encode=1`）。
 
-Install the provider:
+## 安装
+
+**安装本项目（fork，含本文档所述改动）：**
+
+```bash
+pi install github:Loongphy/pi-provider-qoder
+```
+
+**安装上游项目：**
 
 ```bash
 pi install npm:pi-provider-qoder
 ```
 
-Or install it globally with npm:
-
-```bash
-npm install -g pi-provider-qoder
-```
-
-Then log in from pi.
-
-Global / international edition:
+安装后在 pi 中登录：
 
 ```text
-/login qoder
+/login qoder        # 全球站
+/login qoder-cn     # 中国站
 ```
 
-China edition:
-
-```text
-/login qoder-cn
-```
-
-### Personal Access Token (PAT)
-
-A Qoder PAT (`pt-...`) cannot authenticate API calls directly — the provider
-exchanges it for a short-lived job token (mirroring the official `qodercli` /
-`qoderclicn` flow) and resolves your account identity automatically.
-
-Global Qoder:
-
-- Run `/login qoder` and choose **Use API Key (PAT)**, then paste the token.
-- Or set `QODER_PERSONAL_ACCESS_TOKEN` (or `QODER_PAT`) before starting pi.
-- `QODER_API_KEY` is also accepted; when set, pi automatically exchanges it
-  and logs the provider in during startup.
-
-Qoder China:
-
-- Run `/login qoder-cn`, then paste the CN PAT.
-- Or set `QODERCN_PERSONAL_ACCESS_TOKEN` (or `QODERCN_PAT`) before starting pi.
-- `QODERCN_API_KEY` is also accepted and triggers the same automatic startup login.
-
-> The exchanged job token is short-lived; the provider transparently re-exchanges
-> the stored PAT when it expires.
-
-### Region environment variables
-
-The provider also understands these optional variables:
+也可用环境变量免交互登录：
 
 ```bash
-export QODER_REGION=cn       # or QODER_BACKEND=cn / QODER_MODE=cn
+export QODER_PERSONAL_ACCESS_TOKEN=pt-...      # 全球站
+export QODERCN_PERSONAL_ACCESS_TOKEN=pt-...    # 中国站
 ```
 
-Setting a CN PAT without a global PAT also auto-selects CN mode for the `qoder`
-entry, but the recommended explicit China entry is still `/login qoder-cn` and
-`--provider qoder-cn`.
+## 使用
 
-## Endpoints
-
-Global:
-
-- PAT exchange: `https://openapi.qoder.sh/api/v1/jobToken/exchange`
-- User info: `https://openapi.qoder.sh/api/v1/userinfo`
-- Usage: `https://openapi.qoder.sh/api/v2/quota/usage`
-- Model / chat gateway: `https://api3.qoder.sh/algo/api/v2/...`
-
-China:
-
-- PAT exchange: `https://openapi.qoder.com.cn/api/v1/jobToken/exchange`
-- User info: `https://openapi.qoder.com.cn/api/v1/userinfo`
-- Usage: `https://openapi.qoder.com.cn/api/v2/quota/usage`
-- Model / chat gateway: `https://gateway.qoder.com.cn/algo/api/v2/...`
-
-## Models
-
-### Global `qoder`
-
-Exposes the backing model keys returned by Qoder, including:
-
-- **Tier Models**: `auto`, `ultimate`, `performance`, `efficient`, `lite`
-- **Frontier Models**:
-  - `qmodel` (Qwen3.7 Plus)
-  - `cmodel` (Cantus)
-  - `qmodel_preview` (Qwen3.8 Max Preview)
-  - `qmodel_latest` (Qwen3.7 Max)
-  - `dmodel` (DeepSeek V4 Pro)
-  - `dfmodel` (DeepSeek V4 Flash)
-  - `gm51model` (GLM 5.2)
-  - `kmodel` (Kimi K2.7 Code)
-  - `kmodel_latest` (Kimi K3)
-  - `mmodel` (MiniMax M3)
-
-### China `qoder-cn`
-
-The China provider exposes friendly model IDs and maps them back to Qoder CN's
-internal keys at request time:
-
-| Friendly ID | Qoder CN key | Context | Images | Reasoning |
-| --- | --- | ---: | :---: | :---: |
-| `auto` | `auto` | 180K | ✅ | ✅ |
-| `qwen3.7-max` | `qmodel_latest` | 1M | ✅ | ✅ |
-| `qwen3.7-plus` | `qmodel` | 1M | ❌ | ✅ |
-| `qwen3.6-flash` | `q36fmodel` | 1M | ❌ | ✅ |
-| `deepseek-v4-pro` | `dmodel` | 1M | ❌ | ✅ |
-| `deepseek-v4-flash` | `dfmodel` | 1M | ❌ | ❌ |
-| `glm-5.2` | `gm51model` | 200K | ✅ | ✅ |
-| `kimi-k2.6` | `kmodel` | 256K | ✅ | ✅ |
-| `minimax-m2.7` | `mmodel` | 200K | ❌ | ❌ |
-
-Compatibility aliases are also accepted for request mapping, such as
-`qwen3.6-plus` → `qmodel`, `glm-5.1` → `gm51model`, and `minimax-m3` → `mmodel`.
-
-## Usage
-
-Once logged in, select any Qoder model in pi:
+登录后在 pi 里选模型：
 
 ```text
-/model qwen3.7-plus
+/model qwen3.8-max
 ```
 
-Or start directly:
+或直接启动：
 
 ```bash
-pi --provider qoder-cn --model qwen3.7-plus
+pi --provider qoder-cn --model qwen3.8-max
 ```
 
-Global example:
+## 支持的模型
 
-```bash
-pi --provider qoder --model auto
-```
+模型列表由上游动态返回，以下为当前 Qoder CN 实际提供的模型：
 
-## Architecture
+| 显示名 (`Model.id`) | 上游 key | 上下文 | 推理 | 图像 | 免费 | 推理档位 |
+| --- | --- | --- | :---: | :---: | :---: | --- |
+| Qwen3.8-Max | `qmodel_38max` | 1M | ✅ | ✅ | ✅ | off / low / medium / xhigh |
+| Qwen3.8-Flash | `qfmodel` | 1M | ✅ | ✅ | ✅ | off / low / medium / xhigh |
+| Qwen3.7-Max | `qmodel_latest` | 1M | ✅ | ✅ | ✅ | toggle（开/关） |
+| Qwen3.7-Plus | `qmodel` | 1M | ✅ | ✅ | ✅ | toggle（开/关） |
+| Qwen3.7-Flash | `q37fmodel` | 1M | ✅ | ✅ | ✅ | toggle（开/关） |
 
-```text
-src/
-├── index.ts            # Extension registration
-├── cosy.ts             # COSY signature, machine ID, region/endpoints, CN model aliases
-├── login.ts            # OAuth device flow + PAT login sequence
-├── pat.ts              # PAT → job-token exchange + identity resolution
-├── models.ts           # Model definitions and dynamic config cache
-├── oauth.ts            # PAT / OAuth callback orchestrator
-├── stream.ts           # Main streaming response handler
-├── transform.ts        # Message conversions (OpenAI schema mapping)
-├── thinking-parser.ts  # Fallback <think> tag parser
-└── qoder-encoding.ts   # WAF bypass body encoder
-```
+> 上下文为 `context_config` 中的最大可选档；推理档位来自上游 `thinking_config`，effort 模型可选具体等级，toggle 模型只能开关。上游新增/改名模型后会自动跟随，无需改动本插件。
 
 ## License
 
