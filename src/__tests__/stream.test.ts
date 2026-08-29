@@ -371,4 +371,136 @@ describe("streamQoder", () => {
     expect(err, "expected an error event for non-queue 403").toBeDefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  /**
+   * The shape actually observed in production: a 10605 notice that says we were
+   * NOT admitted to a queue (isQueued:false) but should re-submit after 2s.
+   * The original retry implementation required isQueued===true and let this
+   * fall through as a fatal "Upstream status 403".
+   */
+  const REFUSED_QUEUE_NOTICE = {
+    isQueued: false,
+    modelKey: "qfmodel",
+    queueCount: 0,
+    queueType: "slow",
+    retryAfterSeconds: 2,
+    serviceAvailable: true,
+    waitTime: 0,
+  };
+
+  it("retries a 10605 notice that reports isQueued:false, then succeeds", async () => {
+    const fetchMock = mockFetchSequence([queueEnvelope(REFUSED_QUEUE_NOTICE), SUCCESS_SSE]);
+    globalThis.fetch = fetchMock;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event after retrying the refused-queue notice").toBeDefined();
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("stop");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it("honors the advertised retryAfterSeconds and labels a refused slot as busy", async () => {
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    globalThis.fetch = mockFetchSequence([queueEnvelope(REFUSED_QUEUE_NOTICE), SUCCESS_SSE]);
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const status = setWorkingMessage.mock.calls.map((c) => c[0]).find((m) => typeof m === "string");
+    expect(status).toContain("Busy on qfmodel");
+    expect(status).toContain("retry in 2s");
+    // A queue position is meaningless when we were never queued.
+    expect(status).not.toContain("position");
+  }, 20_000);
+
+  it("falls back to a 5s wait for a refused notice with no retryAfterSeconds", async () => {
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    const controller = new AbortController();
+    // Abort while the fallback sleep is pending so the test does not wait 5s.
+    setTimeout(() => controller.abort(), 300);
+    globalThis.fetch = mockFetchSequence([queueEnvelope({ isQueued: false, modelKey: "qfmodel" }), SUCCESS_SSE]);
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
+    );
+
+    const status = setWorkingMessage.mock.calls.map((c) => c[0]).find((m) => typeof m === "string");
+    expect(status).toContain("retry in 5s");
+    const err = events.find((e) => e.type === "error");
+    expect(err, "aborting during the queue wait must end the turn").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.stopReason).toBe("aborted");
+  }, 15_000);
+
+  it("gives up with the original upstream error once the retry budget is exhausted", async () => {
+    // retryAfterSeconds: 0 makes the 60-attempt budget cheap to burn through.
+    const alwaysQueued = queueEnvelope({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0 });
+    const fetchMock = mockFetchSequence([alwaysQueued]);
+    globalThis.fetch = fetchMock;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected the queue notice to surface as an error after the budget").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toMatch(/Upstream status 403/);
+    // 1 initial attempt + 60 retries, then it stops hammering the upstream.
+    expect(fetchMock).toHaveBeenCalledTimes(61);
+  });
+
+  it("clears the working message when the retry budget is exhausted", async () => {
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    globalThis.fetch = mockFetchSequence([
+      queueEnvelope({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0 }),
+    ]);
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const calls = setWorkingMessage.mock.calls.map((c) => c[0]);
+    expect(calls.some((m) => typeof m === "string")).toBe(true);
+    expect(calls[calls.length - 1]).toBeUndefined();
+  });
+
+  it("retries when the notice arrives as a real HTTP 403 instead of an SSE envelope", async () => {
+    let call = 0;
+    const fetchMock = vi.fn(async () => {
+      call++;
+      if (call === 1) {
+        const mid = { code: "10605", message: JSON.stringify(REFUSED_QUEUE_NOTICE) };
+        return new Response(JSON.stringify({ code: "403", message: JSON.stringify(mid) }), { status: 403 });
+      }
+      return new Response(SUCCESS_SSE, { status: 200 });
+    }) as unknown as typeof fetch;
+    globalThis.fetch = fetchMock;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "done")).toBeDefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it("does not retry a queue notice that lands after content was produced", async () => {
+    const partial = sseEnvelope(chunk({ content: "Hel", role: "assistant" })) + queueEnvelope(REFUSED_QUEUE_NOTICE);
+    const fetchMock = mockFetchSequence([partial]);
+    globalThis.fetch = fetchMock;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "a mid-stream notice must surface as an error, not a duplicate turn").toBeDefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-issues each attempt with a fresh request_id and is_retry flag", async () => {
+    const bodies: string[] = [];
+    let call = 0;
+    globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      bodies.push(Buffer.from(init?.body as ArrayBuffer).toString("utf8"));
+      call++;
+      return new Response(call === 1 ? queueEnvelope(REFUSED_QUEUE_NOTICE) : SUCCESS_SSE, { status: 200 });
+    }) as unknown as typeof fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(bodies.length).toBe(2);
+    // The body is obfuscated, so compare lengths/markers rather than parsing:
+    // the retry must not reuse the first attempt's signed bytes verbatim.
+    const first = new TextEncoder().encode(bodies[0]);
+    expect(Buffer.compare(first, new TextEncoder().encode(bodies[1]))).not.toBe(0);
+  }, 20_000);
 });

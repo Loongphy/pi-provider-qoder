@@ -106,25 +106,54 @@ interface QoderQueueInfo {
 }
 
 /**
- * Qoder signals "you are queued" as a non-200 SSE envelope whose body is a
- * triple-nested JSON string:
+ * Qoder signals "the model is saturated, try again later" as a non-200 SSE
+ * envelope whose body is a triple-nested JSON string:
  *
- *   {"code":"403","message":"{\"code\":\"10605\",\"message\":\"{...isQueued...}\"}"}
+ *   {"code":"403","message":"{\"code\":\"10605\",\"message\":\"{...notice...}\"}"}
  *
- * Returns the parsed queue info when the envelope is a genuine queue notice,
- * otherwise null (so unrelated errors keep their original behavior).
+ * The inner notice carries two shapes we have observed:
+ *
+ *   isQueued:true  — we are in a queue; `queueCount`/`waitTime` describe the position.
+ *   isQueued:false — we were NOT admitted to the queue, but `retryAfterSeconds`
+ *                    still says when to re-submit (this is the common shape: {"isQueued":false,"modelKey":"qfmodel","queueCount":0,"queueType":"slow","retryAfterSeconds":2,"serviceAvailable":true,"waitTime":0}).
+ *
+ * Both are transient back-pressure signals carrying a retry hint, so either one
+ * is retryable: the discriminator is the 10605 code, not `isQueued`. Requiring
+ * `isQueued` to be true (as an earlier revision did) let the far more common
+ * isQueued:false notice fall through as a fatal "Upstream status 403".
+ *
+ * Returns the parsed notice for a genuine 10605, otherwise null, so unrelated
+ * 403s (auth/quota/etc.) keep their original error behavior.
  */
 function parseQoderQueueInfo(bodyStr: string): QoderQueueInfo | null {
   try {
     const outer = JSON.parse(bodyStr) as { code?: string | number; message?: string };
-    if (String(outer.code) !== "403") return null;
-    const mid = JSON.parse(outer.message ?? "") as { code?: string | number; message?: string };
+    // Normal shape: the transport wraps the notice in a {code:"403"} envelope.
+    // An HTTP-level 403 may instead deliver the 10605 layer directly, so accept
+    // either nesting depth.
+    const mid =
+      String(outer.code) === "403"
+        ? (JSON.parse(outer.message ?? "") as { code?: string | number; message?: string })
+        : outer;
     if (String(mid.code) !== "10605") return null;
     const inner = JSON.parse(mid.message ?? "") as QoderQueueInfo;
-    return inner?.isQueued ? inner : null;
+    // A 10605 whose payload we cannot read is not a back-pressure notice.
+    return inner && typeof inner === "object" ? inner : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * How long to wait before re-submitting, per the upstream hint. An explicit
+ * 0 is honored (immediate retry); a missing hint falls back to 30s when we are
+ * actually queued and 5s when we were refused a queue slot. Clamped so one
+ * absurdly large hint cannot exceed the whole retry budget by itself.
+ */
+function qoderQueueRetrySeconds(queueInfo: QoderQueueInfo): number {
+  const advertised = queueInfo.retryAfterSeconds;
+  const sec = typeof advertised === "number" && Number.isFinite(advertised) ? advertised : queueInfo.isQueued ? 30 : 5;
+  return Math.min(Math.max(sec, 0), 120);
 }
 
 function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
@@ -161,10 +190,10 @@ function formatQoderDuration(totalSeconds: number): string {
  * interactive working row via setWorkingMessage.
  */
 function reportQoderQueueStatus(queueInfo: QoderQueueInfo, attempt: number, maxRetries: number): void {
-  const waitSec = queueInfo.retryAfterSeconds ?? 30;
+  const waitSec = qoderQueueRetrySeconds(queueInfo);
   const estSec = Math.round((queueInfo.waitTime || 0) / 1000);
-  const parts: string[] = [`Queued on ${queueInfo.modelKey || "model"}`];
-  if (queueInfo.queueCount != null) parts.push(`position ${queueInfo.queueCount}`);
+  const parts: string[] = [`${queueInfo.isQueued ? "Queued" : "Busy"} on ${queueInfo.modelKey || "model"}`];
+  if (queueInfo.isQueued && queueInfo.queueCount != null) parts.push(`position ${queueInfo.queueCount}`);
   if (queueInfo.queueType) parts.push(`${queueInfo.queueType} queue`);
   if (estSec > 0) parts.push(`est. wait ~${formatQoderDuration(estSec)}`);
   parts.push(`retry in ${waitSec}s (${attempt}/${maxRetries})`);
@@ -365,19 +394,25 @@ export function streamQoder(
         },
       };
 
-      const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-      const encodedBody = qoderEncodeBody(bodyBytes);
-      const encodedBytes = Buffer.from(encodedBody, "utf8");
-
       const chatURL = getQoderChatURL(providerMode);
+      const cosyCreds = { userID, authToken: accessToken, name, email, machineID };
 
-      const headers = buildAuthHeaders(encodedBytes, chatURL, {
-        userID,
-        authToken: accessToken,
-        name,
-        email,
-        machineID,
-      });
+      /**
+       * Encode the request for one attempt. Retries MUST carry a fresh
+       * `request_id`/`is_retry` and a freshly signed COSY header set: the
+       * signature covers a unix timestamp, so reusing the headers captured
+       * before a multi-second queue wait risks a replay/expiry rejection, and
+       * reusing the upstream `request_id` risks the gateway treating the retry
+       * as a duplicate. `chat_record_id`/`request_set_id`/`session_id` stay
+       * stable so prompt-cache and conversation affinity survive the retry.
+       */
+      const prepareAttempt = (isRetry: boolean) => {
+        reqBody.request_id = crypto.randomUUID();
+        reqBody.is_retry = isRetry;
+        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+        const encodedBytes = Buffer.from(qoderEncodeBody(bodyBytes), "utf8");
+        return { body: encodedBytes, headers: buildAuthHeaders(encodedBytes, chatURL, cosyCreds) };
+      };
 
       const modelSource = modelConfig.source || "system";
 
@@ -387,6 +422,18 @@ export function streamQoder(
       let streamStarted = false;
       let queueRetries = 0;
       let retryQueued = false;
+
+      // Retrying is only safe before anything reached the consumer: once a
+      // block (text/thinking/tool call) exists, a re-submit would duplicate it.
+      const canRetryQueue = (): boolean =>
+        !streamStarted && output.content.length === 0 && queueRetries < QODER_MAX_QUEUE_RETRIES;
+
+      const doQueueRetry = async (queueInfo: QoderQueueInfo): Promise<void> => {
+        queueRetries++;
+        reportQoderQueueStatus(queueInfo, queueRetries, QODER_MAX_QUEUE_RETRIES);
+        await sleepMs(qoderQueueRetrySeconds(queueInfo) * 1000, options?.signal);
+        retryQueued = true;
+      };
 
       const decoder = new TextDecoder();
       let contentBlockIndex = -1;
@@ -398,6 +445,7 @@ export function streamQoder(
 
       do {
         retryQueued = false;
+        const attempt = prepareAttempt(queueRetries > 0);
         const response = await fetch(chatURL, {
           method: "POST",
           headers: {
@@ -407,14 +455,21 @@ export function streamQoder(
             "Accept-Encoding": "identity",
             "X-Model-Key": qoderModel,
             "X-Model-Source": modelSource,
-            ...headers,
+            ...attempt.headers,
           },
-          body: encodedBytes,
+          body: attempt.body,
           signal: options?.signal,
         });
 
         if (!response.ok) {
           const errText = await response.text();
+          // The same back-pressure notice can arrive as a real HTTP status
+          // instead of an SSE envelope; only a genuine 10605 is retryable.
+          const httpQueueInfo = response.status === 403 ? parseQoderQueueInfo(errText) : null;
+          if (httpQueueInfo && canRetryQueue()) {
+            await doQueueRetry(httpQueueInfo);
+            continue;
+          }
           throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
         }
 
@@ -445,20 +500,15 @@ export function streamQoder(
             try {
               const envelope = JSON.parse(dataStr);
               if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-                // Qoder returns a 403 "queued" notice when the upstream model is
-                // saturated. If we have not produced any content yet, wait the
-                // advertised retry interval and re-submit instead of failing.
+                // Qoder returns a 403/10605 back-pressure notice when the
+                // upstream model is saturated. If nothing has reached the
+                // consumer yet, wait the advertised retry interval and
+                // re-submit instead of failing the turn. This covers both
+                // isQueued:true (in the slow queue) and isQueued:false
+                // (refused a slot, "come back in N seconds").
                 const queueInfo = parseQoderQueueInfo(envelope.body);
-                if (
-                  queueInfo &&
-                  contentBlockIndex === -1 &&
-                  thinkingBlockIndex === -1 &&
-                  queueRetries < QODER_MAX_QUEUE_RETRIES
-                ) {
-                  queueRetries++;
-                  reportQoderQueueStatus(queueInfo, queueRetries, QODER_MAX_QUEUE_RETRIES);
-                  await sleepMs((queueInfo.retryAfterSeconds ?? 30) * 1000, options?.signal);
-                  retryQueued = true;
+                if (queueInfo && canRetryQueue()) {
+                  await doQueueRetry(queueInfo);
                   break;
                 }
                 throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
@@ -697,6 +747,7 @@ export function streamQoder(
       });
       stream.end();
     } catch (e: unknown) {
+      clearQoderQueueStatus();
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       stream.push({ type: "error", reason: output.stopReason, error: output });
