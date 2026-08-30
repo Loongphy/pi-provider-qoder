@@ -68,3 +68,69 @@ describe("qoderEncodeBody", () => {
     expect(result).not.toContain("=");
   });
 });
+
+describe("qoderEncodeBody equivalence with the reference implementation", () => {
+  /**
+   * The naive transcription of Qoder's obfuscation, kept here on purpose: the
+   * production version is optimized (table lookup into a preallocated buffer),
+   * and this is the only thing standing between a refactor and silently
+   * changing the wire bytes the upstream rejects.
+   */
+  function referenceEncode(plaintext: string | Buffer): string {
+    const customAlphabet = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    const stdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std = Buffer.isBuffer(plaintext) ? plaintext.toString("base64") : Buffer.from(plaintext).toString("base64");
+    const n = std.length;
+    const a = Math.floor(n / 3);
+    const rearranged = std.slice(n - a) + std.slice(a, n - a) + std.slice(0, a);
+    let out = "";
+    for (let i = 0; i < n; i++) {
+      const c = rearranged[i];
+      if (c === "=") out += "$";
+      else {
+        const idx = stdAlphabet.indexOf(c);
+        out += idx >= 0 ? customAlphabet[idx] : c;
+      }
+    }
+    return out;
+  }
+
+  it("matches byte-for-byte across input lengths and alphabets", () => {
+    const cases: (string | Buffer)[] = [
+      "",
+      "a",
+      "ab",
+      "abc",
+      "abcd",
+      "abcde",
+      "hello world",
+      JSON.stringify({ k: "v", n: 1, arr: [1, 2, 3] }),
+      "中文与 emoji 🚀 mixed",
+      Buffer.from([0x00, 0x01, 0xfe, 0xff]),
+    ];
+    // Every base64 length residue class, plus long enough to rotate segments.
+    for (let len = 0; len <= 200; len++) {
+      cases.push(Buffer.alloc(len, 0x5a).toString("base64"));
+      cases.push("x".repeat(len));
+    }
+    // A pseudo-random byte sweep, all three padding classes. Math.imul keeps
+    // the LCG inside int32 so the sequence is deterministic (a plain multiply
+    // overflows Number.MAX_SAFE_INTEGER and loses precision).
+    let seed = 12345;
+    const rand = () => {
+      seed = (Math.imul(seed, 1103515245) + 12345) | 0;
+      return (seed >>> 8) & 0xff;
+    };
+    for (let len = 0; len < 64; len++) {
+      cases.push(Buffer.from(Array.from({ length: len }, rand)));
+    }
+
+    for (const c of cases) {
+      expect(qoderEncodeBody(c), `input: ${String(c).slice(0, 24)}`).toBe(referenceEncode(c));
+    }
+  });
+
+  it("pins the wire format with a golden vector", () => {
+    expect(qoderEncodeBody("hello")).toBe("q$FruHPH");
+  });
+});
