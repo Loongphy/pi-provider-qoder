@@ -18,6 +18,7 @@ import {
   getMachineId,
   getQoderChatURL,
   getQoderMode,
+  getQoderQueueStatusURL,
   getQoderUserEmailFallback,
   isQoderCNMode,
 } from "./cosy.js";
@@ -94,17 +95,13 @@ export function setQoderUI(ui: QoderWorkingUI | undefined): void {
 }
 
 /**
- * How long we keep re-submitting while the upstream keeps us queued.
+ * How long we keep waiting while the upstream keeps us queued.
  *
- * A wall-clock budget rather than an attempt count, like qodercli's
- * QODER_MODEL_QUEUE_MAX_WAIT_MS (default 36e5 = 1h). We default lower on
- * purpose: qodercli spends its wait polling a cheap queue-status endpoint
- * (/api/v2/service/ask/queue/status), while every one of our waits ends in a
- * full re-POST of the conversation. Set QODER_MODEL_QUEUE_MAX_WAIT_MS to match
- * the upstream hour if you want it. This budget is also what bounds an
- * unusually large retryAfterSeconds hint.
+ * A wall-clock budget rather than an attempt count, identical to qodercli's
+ * QODER_MODEL_QUEUE_MAX_WAIT_MS and its default (`PSl = 36e5`, one hour). The
+ * budget is also what bounds an unusually large retry hint.
  */
-const QODER_QUEUE_MAX_WAIT_MS_DEFAULT = 600_000;
+const QODER_QUEUE_MAX_WAIT_MS_DEFAULT = 3_600_000;
 
 function qoderQueueMaxWaitMs(): number {
   const raw = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
@@ -121,8 +118,49 @@ interface QoderQueueInfo {
   queueCount?: number;
   queueType?: string;
   retryAfterSeconds?: number;
+  /** Millisecond hints, which qodercli reads BEFORE the seconds field. */
+  retry_after_ms?: number;
+  retryAfterMs?: number;
   serviceAvailable?: boolean;
   waitTime?: number;
+}
+
+/** qodercli's `S3A`: only a real boolean counts; anything else is absent. */
+function qoderBool(value: unknown): boolean | undefined {
+  return value === true || value === false ? value : undefined;
+}
+
+/** qodercli's `bp`: a finite number, or a string of digits. */
+function qoderNum(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number(value.trim());
+  return undefined;
+}
+
+/** qodercli's `VK`: a non-empty trimmed string. */
+function qoderStr(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * qodercli's `LSl` field normalization: every field goes through a type guard,
+ * and junk values become absent rather than being trusted downstream. Without
+ * this a gateway that sends `"retryAfterSeconds":"30"` would have its hint
+ * silently ignored.
+ */
+function normalizeQoderQueueInfo(record: Record<string, unknown>): QoderQueueInfo {
+  const info: QoderQueueInfo = {
+    isQueued: qoderBool(record.isQueued),
+    modelKey: qoderStr(record.modelKey),
+    queueCount: qoderNum(record.queueCount),
+    queueType: qoderStr(record.queueType),
+    serviceAvailable: qoderBool(record.serviceAvailable),
+    retryAfterSeconds: qoderNum(record.retryAfterSeconds),
+    retry_after_ms: qoderNum(record.retry_after_ms),
+    retryAfterMs: qoderNum(record.retryAfterMs),
+    waitTime: qoderNum(record.waitTime),
+  };
+  return Object.fromEntries(Object.entries(info).filter(([, value]) => value !== undefined)) as QoderQueueInfo;
 }
 
 /**
@@ -156,38 +194,106 @@ function parseQoderQueueInfo(bodyStr: string): QoderQueueInfo | null {
         ? (JSON.parse(outer.message ?? "") as { code?: string | number; message?: string })
         : outer;
     if (String(mid.code) !== "10605") return null;
-    const inner = JSON.parse(mid.message ?? "") as QoderQueueInfo;
+    const inner = JSON.parse(mid.message ?? "");
     // A 10605 whose payload we cannot read is not a back-pressure notice.
-    return inner && typeof inner === "object" ? inner : null;
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) return null;
+    return normalizeQoderQueueInfo(inner as Record<string, unknown>);
   } catch {
     return null;
   }
 }
 
 /**
- * How long to wait before re-submitting: exactly what the notice asked for.
+ * The upstream hint in milliseconds, or undefined when the reply carried none.
  *
- * `retryAfterSeconds` is the upstream's own "come back at T" hint, so it is
- * honored as-is, with no clamp. qodercli bounds it into [500ms, 30s] via
- * `Can()`, but those are throttle limits for its cheap queue-status POLL;
- * imposing them here would re-POST the whole conversation early whenever the
- * hint exceeds 30s, and add pointless latency whenever it is shorter.
+ * qodercli reads the fields in this priority order (`mja()`/`qK()`/`XRA()`):
+ * an explicit millisecond field (`retry_after_ms`, `retryAfterMs`) wins, then
+ * `retryAfterSeconds` scaled by 1000. Both go through `bp()`, so a digit-string
+ * hint counts too.
  *
- * Two guards only:
- * - a 100ms anti-spin floor, so a 0/negative hint cannot turn the retry budget
- *   into a tight loop of full-conversation uploads;
- * - 1s when the notice carries no usable hint at all (not observed in
- *   practice: both the queued and the refused-a-slot shapes send the field).
- *
- * The wall-clock budget applied by the caller is what bounds an absurdly large
- * hint.
+ * The 100ms floor is ours, not qodercli's: a zero/negative hint must not turn
+ * the retry budget into a tight loop of full-conversation uploads.
  */
+function qoderQueueHintMs(queueInfo: QoderQueueInfo): number | undefined {
+  const ms = qoderNum(queueInfo.retry_after_ms) ?? qoderNum(queueInfo.retryAfterMs);
+  if (ms !== undefined) return Math.max(100, ms);
+  const seconds = qoderNum(queueInfo.retryAfterSeconds);
+  return seconds === undefined ? undefined : Math.max(100, seconds * 1000);
+}
+
+/** How long to wait before a full re-POST: the hint as-is, 1s when absent. */
 function qoderQueueRetryMs(queueInfo: QoderQueueInfo): number {
-  const advertised = queueInfo.retryAfterSeconds;
-  if (typeof advertised === "number" && Number.isFinite(advertised)) {
-    return Math.max(100, advertised * 1000);
+  return qoderQueueHintMs(queueInfo) ?? 1_000;
+}
+
+/**
+ * qodercli's `Can()`: the interval between queue-status LOOKs is clamped into
+ * [500ms, 30s] (`ySl`/`kSl`), defaulting to 30s (`TSl`) when the reply carries
+ * no hint. It applies to POLLING only -- a cheap GET the server is expected to
+ * answer often -- so a hint above 30s means "look again in 30s", not "resend
+ * early". A re-POST wait keeps the full hint instead (see waitQueueHint).
+ */
+const QODER_QUEUE_POLL_MIN_MS = 500;
+const QODER_QUEUE_POLL_MAX_MS = 30_000;
+const QODER_QUEUE_POLL_DEFAULT_MS = 30_000;
+
+function qoderQueuePollMs(queueInfo: QoderQueueInfo): number {
+  const hint = qoderQueueHintMs(queueInfo) ?? QODER_QUEUE_POLL_DEFAULT_MS;
+  return Math.min(QODER_QUEUE_POLL_MAX_MS, Math.max(QODER_QUEUE_POLL_MIN_MS, hint));
+}
+
+/** Consecutive poll failures tolerated before we stop polling (qodercli: 3). */
+export const QODER_QUEUE_POLL_MAX_FAILURES = 3;
+
+/**
+ * Whether to poll /queue/status while waiting. Enabled by default; set
+ * QODER_QUEUE_POLL=0 to go straight back to "sleep the hint, re-POST".
+ */
+function qoderQueuePollEnabled(): boolean {
+  const raw = process.env.QODER_QUEUE_POLL;
+  return raw === undefined || !/^(0|false|off)$/i.test(raw.trim());
+}
+
+/**
+ * Parse the queue-status response. Mirrors qodercli's `queueStatus()` walk:
+ * the flags may sit at any depth and may arrive as stringified JSON inside
+ * `data`/`result`/`message`/`body`, so breadth-search until a record carries a
+ * boolean `isQueued` or `serviceAvailable` (qodercli's LSl accepts exactly
+ * those two as the shape marker).
+ */
+function parseQoderQueueStatus(bodyStr: string): QoderQueueInfo | null {
+  let root: unknown;
+  try {
+    root = JSON.parse(bodyStr);
+  } catch {
+    return null;
   }
-  return 1_000;
+
+  const seen = new Set<unknown>();
+  const queue: unknown[] = [root];
+  while (queue.length > 0) {
+    const node = queue.shift();
+    // qodercli's `GI`: only plain objects are walked, arrays are skipped.
+    if (!node || typeof node !== "object" || Array.isArray(node) || seen.has(node)) continue;
+    seen.add(node);
+    const record = node as Record<string, unknown>;
+    // qodercli's `LSl` accepts a record as queue-shaped when either flag is a
+    // real boolean, then normalizes every field.
+    if (qoderBool(record.isQueued) !== undefined || qoderBool(record.serviceAvailable) !== undefined) {
+      return normalizeQoderQueueInfo(record);
+    }
+    for (const key of ["data", "result", "message", "body"]) {
+      const child = record[key];
+      if (child && typeof child === "object" && !Array.isArray(child)) {
+        queue.push(child);
+      } else if (typeof child === "string" && child.length > 0) {
+        try {
+          queue.push(JSON.parse(child));
+        } catch {}
+      }
+    }
+  }
+  return null;
 }
 
 function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
@@ -220,23 +326,62 @@ function formatQoderDuration(totalSeconds: number): string {
 }
 
 /**
- * Report queue status both to stderr (for logs / non-TUI modes) and to the pi
- * interactive working row via setWorkingMessage.
+ * What the wait we are about to take actually is:
+ * - "watching": sleeping until the next queue-status LOOK (no upload);
+ * - "retry": sleeping until the next full re-POST of the conversation;
+ * - "ready": the slot opened, resending now.
  */
-function reportQoderQueueStatus(queueInfo: QoderQueueInfo, waitedMs: number, maxWaitMs: number): void {
-  const waitSec = +(qoderQueueRetryMs(queueInfo) / 1000).toFixed(1);
-  const estSec = Math.round((queueInfo.waitTime || 0) / 1000);
-  const parts: string[] = [`${queueInfo.isQueued ? "Queued" : "Busy"} on ${queueInfo.modelKey || "model"}`];
+type QoderQueuePhase = "watching" | "retry" | "ready";
+
+/**
+ * The one-line queue status shown in the pi working row and (throttled) on
+ * stderr.
+ *
+ * `remainingMs` is the live part: the caller re-derives it from the wait
+ * deadline on every tick, so the countdown counts down instead of sitting
+ * frozen at whatever the last notice happened to say.
+ */
+function formatQoderQueueMessage(
+  queueInfo: QoderQueueInfo,
+  modelLabel: string,
+  waitedMs: number,
+  maxWaitMs: number,
+  phase: QoderQueuePhase,
+  remainingMs: number,
+): string {
+  const parts: string[] = [`${queueInfo.isQueued ? "Queued" : "Busy"} on ${modelLabel}`];
   if (queueInfo.isQueued && queueInfo.queueCount != null) parts.push(`position ${queueInfo.queueCount}`);
   if (queueInfo.queueType) parts.push(`${queueInfo.queueType} queue`);
-  if (estSec > 0) parts.push(`est. wait ~${formatQoderDuration(estSec)}`);
-  parts.push(
-    `retry in ${waitSec}s (waited ${formatQoderDuration(waitedMs / 1000)}/${formatQoderDuration(maxWaitMs / 1000)})`,
-  );
-  const msg = parts.join(" \u00B7 ");
-  console.error(`[pi-provider-qoder] ${msg}`);
+  // qodercli reads this field as SECONDS (`_5e()`: `waitTimeMs = 1e3 * waitTime`,
+  // reported to telemetry as `queue_server_wait_time_ms`), so we do the same.
+  // The one large sample we have (1401187) is then 16 days, which is not a
+  // credible queue estimate -- it is far more likely the gateway sends ms. We
+  // follow qodercli's unit and suppress anything past 6h, so a unit mismatch
+  // degrades to "no estimate" instead of printing a nonsense number.
+  const estSec = qoderNum(queueInfo.waitTime);
+  if (estSec !== undefined && estSec > 0 && estSec < 6 * 3600) {
+    parts.push(`est. wait ~${formatQoderDuration(estSec)}`);
+  }
+  const budget = `waited ${formatQoderDuration(waitedMs / 1000)}/${formatQoderDuration(maxWaitMs / 1000)}`;
+  const left = `${Math.max(0, Math.ceil(remainingMs / 1000))}s`;
+  if (phase === "ready") parts.push(`slot free \u00B7 resending in ${left} (${budget})`);
+  else if (phase === "watching") parts.push(`check again in ${left} (${budget})`);
+  else parts.push(`retry in ${left} (${budget})`);
+  return parts.join(" \u00B7 ");
+}
+
+/**
+ * Report queue status to the pi interactive working row via setWorkingMessage,
+ * and to stderr when `log` is set.
+ *
+ * The two sinks are deliberately decoupled: the working row is a status line
+ * and is safe to rewrite every second, while stderr is a log and is not.
+ */
+function reportQoderQueueStatus(message: string, opts: { log: boolean }): void {
+  if (opts.log) console.error(`[pi-provider-qoder] ${message}`);
   try {
-    qoderUI?.setWorkingMessage?.(`\u23F3 ${msg}`);
+    // The pi working row prefixes its own spinner; the message is plain text.
+    qoderUI?.setWorkingMessage?.(message);
   } catch {}
 }
 
@@ -548,17 +693,218 @@ export function streamQoder(
       const canRetryQueue = (): boolean => !streamStarted && output.content.length === 0;
 
       // Wall-clock budget instead of an attempt cap, like the upstream CLI.
+      // `queueBudgetExhausted` latches the moment a wait has slept the budget
+      // down to its edge: without it, a wait that ends within a millisecond of
+      // the deadline can still see a positive remaining budget and buy one more
+      // full re-upload of the conversation before the notice site gives up.
+      let queueBudgetExhausted = false;
       const queueBudgetSpent = (): boolean =>
-        queueWaitStartedAt > 0 && Date.now() - queueWaitStartedAt >= qoderQueueMaxWaitMs();
+        queueWaitStartedAt > 0 && (queueBudgetExhausted || Date.now() - queueWaitStartedAt >= qoderQueueMaxWaitMs());
+
+      const queueWaitedMs = (): number => (queueWaitStartedAt === 0 ? 0 : Date.now() - queueWaitStartedAt);
+      const queueRemainingMs = (): number => qoderQueueMaxWaitMs() - queueWaitedMs();
+
+      /**
+       * How often the working row is re-rendered while we wait. The countdown
+       * is shown in whole seconds, so anything slower makes the line look
+       * frozen — which is exactly the "retry in 30s never moves" complaint.
+       * The TUI already re-renders on its own spinner frames, so one extra
+       * requestRender per second is free.
+       */
+      const QUEUE_TICK_MS = 1_000;
+      /** stderr is not a status line: only log on a real change, or heartbeat. */
+      const QUEUE_LOG_MIN_INTERVAL_MS = 15_000;
+
+      let lastLogKey = "";
+      let lastLoggedAt = 0;
+
+      /**
+       * The pi-visible model name for an upstream key -- what /model shows
+       * (`display_name`), not the raw gateway key. The catalog cache is indexed
+       * by both the upstream key and the pi id, so a lookup by key lands either
+       * way; without an entry the key itself is the honest fallback.
+       *
+       * Memoized per key: the cache file is re-read on every miss, and the
+       * status line ticks once a second.
+       */
+      let lastModelLabel: { key: string; label: string } | undefined;
+      const modelLabelFor = (key: string | undefined): string => {
+        if (!key) return "model";
+        if (lastModelLabel?.key === key) return lastModelLabel.label;
+        const label = getCachedModelConfig(key, providerMode)?.display_name || key;
+        lastModelLabel = { key, label };
+        return label;
+      };
+
+      /**
+       * Push one status line to the working row. The stderr copy is written only
+       * when the line actually says something new (phase or position moved) or
+       * every QUEUE_LOG_MIN_INTERVAL_MS, so a long wait is not silent without
+       * turning the log into a countdown.
+       */
+      const renderQueue = (info: QoderQueueInfo, phase: QoderQueuePhase, remainingMs: number): void => {
+        const message = formatQoderQueueMessage(
+          info,
+          modelLabelFor(info.modelKey),
+          queueWaitedMs(),
+          qoderQueueMaxWaitMs(),
+          phase,
+          remainingMs,
+        );
+        const key = `${phase}|${info.isQueued}|${info.queueCount ?? ""}|${info.serviceAvailable}`;
+        const now = Date.now();
+        const log = key !== lastLogKey || now - lastLoggedAt >= QUEUE_LOG_MIN_INTERVAL_MS;
+        if (log) {
+          lastLogKey = key;
+          lastLoggedAt = now;
+        }
+        reportQoderQueueStatus(message, { log });
+      };
+
+      /**
+       * Wait out the advertised hint, ticking the status line as we go.
+       *
+       * One long sleep used to mean one render: the line went out carrying the
+       * full hint and then sat unchanged for the whole wait, so "retry in 30s"
+       * and a stale "position 450" read as a hung request. Sleeping in slices of
+       * at most one tick re-renders every second (fresh countdown, fresh elapsed
+       * budget) and keeps the wait interruptible, since each slice re-checks the
+       * abort signal.
+       *
+       * Never sleeps past the retry budget: a spent budget degenerates into one
+       * final attempt that the notice site rejects with the original error.
+       */
+      const waitQueueHint = async (info: QoderQueueInfo, phase: QoderQueuePhase): Promise<void> => {
+        // "watching" sleeps until the next queue-status LOOK, which qodercli
+        // clamps into [500ms, 30s] via `Can()`; "ready"/"retry" sleep until a
+        // full re-POST, which honors the hint as-is because the body is the
+        // whole conversation -- clamping it would upload early.
+        const hint = phase === "watching" ? qoderQueuePollMs(info) : qoderQueueRetryMs(info);
+        const remainingBudget = Math.max(0, queueRemainingMs());
+        const total = Math.min(hint, remainingBudget);
+        // Sleeping the budget down to its edge spends it: latch it so the notice
+        // site surfaces the original upstream error on the next resend instead
+        // of racing the clock into another full upload.
+        if (total >= remainingBudget) queueBudgetExhausted = true;
+        const deadline = Date.now() + total;
+        renderQueue(info, phase, total);
+        for (;;) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          await sleepMs(Math.min(QUEUE_TICK_MS, remaining), options?.signal);
+          renderQueue(info, phase, Math.max(0, deadline - Date.now()));
+        }
+      };
+
+      /**
+       * One GET on the queue-status endpoint (no body: the signature covers an
+       * empty one, same convention as the signed model-catalog request).
+       *
+       * Returns the parsed flags, or null when the endpoint cannot serve us --
+       * 404 (a deployment without it), 401/403 (we cannot refresh the token
+       * from the stream layer) or a body with no queue flags. Anything else
+       * throws so the caller can count transient failures.
+       */
+      const fetchQueueStatus = async (info: QoderQueueInfo): Promise<QoderQueueInfo | null> => {
+        const url = getQoderQueueStatusURL(providerMode, {
+          requestSetID: recordID,
+          modelKey: info.modelKey || qoderModel,
+          queueType: info.queueType,
+        });
+        const response = await fetch(url, {
+          method: "GET",
+          headers: { Accept: "application/json", ...buildAuthHeaders(null, url, cosyCreds) },
+          signal: options?.signal,
+        });
+        const text = await response.text().catch(() => "");
+        if (response.status === 401 || response.status === 403 || response.status === 404) return null;
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        // A body we cannot read is treated like an unusable endpoint rather than
+        // a retryable failure: the flags are the whole point of the call.
+        return parseQoderQueueStatus(text);
+      };
+
+      /**
+       * Wait out the queue by polling it instead of re-POSTing the conversation.
+       *
+       * The queue notice's `retryAfterSeconds` only says how long until the next
+       * LOOK; the slot being free is what authorizes the resend (qodercli's
+       * `hLl`: on `isQueued === false` it sleeps the ready hint once and only
+       * then returns to the caller). Queueing runs for minutes and our request
+       * body is the entire conversation -- measured up to 14.7MB -- so waiting
+       * by resend would upload it again every few seconds, while waiting by poll
+       * costs a handful of tiny GETs.
+       *
+       * "ready" means the slot opened and the ready hint has been slept, so the
+       * caller may re-send. "stop-polling" means the poll route is not usable
+       * (or the budget ran out) and the caller should degrade to a plain
+       * hint-length wait before re-sending: a missing or broken queue API must
+       * not turn a recoverable back-pressure notice into a failed turn.
+       */
+      const pollQueueUntilSlotOpens = async (
+        notice: QoderQueueInfo,
+      ): Promise<{ outcome: "ready" | "stop-polling"; info: QoderQueueInfo }> => {
+        let latest: QoderQueueInfo = notice;
+        let failures = 0;
+        while (!queueBudgetSpent() && queueRemainingMs() > 0) {
+          try {
+            const status = await fetchQueueStatus(latest);
+            if (!status) return { outcome: "stop-polling", info: latest };
+            failures = 0;
+            // Carry the identifying fields forward: a status reply that omits
+            // them would otherwise make the line lose the model it is waiting on.
+            latest = {
+              ...status,
+              modelKey: status.modelKey || latest.modelKey,
+              queueType: status.queueType || latest.queueType,
+            };
+            if (status.isQueued === false) {
+              await waitQueueHint(latest, "ready");
+              return { outcome: "ready", info: latest };
+            }
+          } catch (e) {
+            if (options?.signal?.aborted) throw e;
+            failures++;
+            if (failures >= QODER_QUEUE_POLL_MAX_FAILURES) {
+              const reason = e instanceof Error ? e.message : String(e);
+              console.error(`[pi-provider-qoder] queue status polling disabled after ${failures} failures: ${reason}`);
+              return { outcome: "stop-polling", info: latest };
+            }
+          }
+          // Still queued, the service says it is unavailable, or the look just
+          // failed: sleep the hint and look again.
+          await waitQueueHint(latest, "watching");
+        }
+        return { outcome: "stop-polling", info: latest };
+      };
 
       const doQueueRetry = async (queueInfo: QoderQueueInfo): Promise<void> => {
-        const maxWaitMs = qoderQueueMaxWaitMs();
         if (queueWaitStartedAt === 0) queueWaitStartedAt = Date.now();
-        const waitedMs = Date.now() - queueWaitStartedAt;
-        reportQoderQueueStatus(queueInfo, waitedMs, maxWaitMs);
-        // Never sleep past the budget: either we resume inside it, or the next
-        // notice finds it spent and surfaces the upstream error.
-        await sleepMs(Math.min(qoderQueueRetryMs(queueInfo), Math.max(0, maxWaitMs - waitedMs)), options?.signal);
+        let latest = queueInfo;
+
+        // Say what the notice said the moment it lands, before the first look:
+        // the notice carries the position and the `waitTime` estimate, which a
+        // status reply may not repeat. qodercli renders the current state at the
+        // top of every loop iteration for the same reason.
+        renderQueue(
+          latest,
+          qoderQueuePollEnabled() ? "watching" : "retry",
+          qoderQueuePollEnabled() ? qoderQueuePollMs(latest) : qoderQueueRetryMs(latest),
+        );
+
+        if (qoderQueuePollEnabled()) {
+          const polled = await pollQueueUntilSlotOpens(latest);
+          latest = polled.info;
+          if (polled.outcome === "ready") {
+            retryQueued = true;
+            return;
+          }
+        }
+
+        // No poll route (or polling off): wait the hint and re-send. The wait is
+        // capped by the remaining budget, so a spent budget degenerates into one
+        // final attempt that the notice site rejects with the original error.
+        await waitQueueHint(latest, "retry");
         retryQueued = true;
       };
 
@@ -588,7 +934,10 @@ export function streamQoder(
         });
 
         if (!response.ok) {
-          const errText = await response.text();
+          // A gateway that hangs up mid-body makes `text()` reject with
+          // undici's `TypeError: terminated`. An empty body still lets the
+          // queue check below run, and otherwise yields the same 403 error.
+          const errText = await response.text().catch(() => "");
           // The same back-pressure notice can arrive as a real HTTP status
           // instead of an SSE envelope; only a genuine 10605 is retryable.
           const httpQueueInfo = response.status === 403 ? parseQoderQueueInfo(errText) : null;
@@ -603,11 +952,38 @@ export function streamQoder(
         if (!reader) throw new Error("No response body");
         let buffer = "";
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        // Set as soon as the stream itself tells us it is over (`[DONE]`) or
+        // that we should come back later (a queue notice). See readChunk.
+        let bodySpent = false;
 
-          buffer += decoder.decode(value, { stream: true });
+        /**
+         * One body read.
+         *
+         * Qoder's gateway routinely drops the socket right after writing a
+         * queue notice, and undici reports a truncated body as `TypeError:
+         * terminated`. Because the notice only used to `break` out of the LINE
+         * loop, we went straight back to `reader.read()` on that dead body and
+         * the rejection escaped as a failed turn — the "Error: terminated" that
+         * shows up a few times before a queued request really resumes, with the
+         * throw also discarding the recoverable notice we had just parsed.
+         *
+         * Once the body has said it is spent we are abandoning it anyway, so
+         * its death is not our error.
+         */
+        const readChunk = async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          try {
+            return await reader.read();
+          } catch (e) {
+            if (bodySpent) return { done: true };
+            throw e;
+          }
+        };
+
+        readLoop: while (true) {
+          const chunk = await readChunk();
+          if (chunk.done || chunk.value === undefined) break;
+
+          buffer += decoder.decode(chunk.value, { stream: true });
 
           while (true) {
             const lineEnd = buffer.indexOf("\n");
@@ -620,6 +996,7 @@ export function streamQoder(
 
             const dataStr = line.substring(5).trim();
             if (dataStr === "[DONE]") {
+              bodySpent = true;
               break;
             }
 
@@ -635,7 +1012,11 @@ export function streamQoder(
                 const queueInfo = parseQoderQueueInfo(envelope.body);
                 if (queueInfo && canRetryQueue() && !queueBudgetSpent()) {
                   await doQueueRetry(queueInfo);
-                  break;
+                  // Leave the whole read loop, not just the line loop: the
+                  // response is finished as far as we are concerned, and the
+                  // do-while below re-submits it.
+                  bodySpent = true;
+                  break readLoop;
                 }
                 throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
               }
@@ -647,6 +1028,10 @@ export function streamQoder(
               }
 
               const innerStr = envelope.body;
+              // Qoder wraps the terminator in an envelope (`body:"[DONE]"`), so
+              // the `dataStr === "[DONE]"` test above never matches it: the
+              // inner body is what says the stream is over.
+              if (innerStr === "[DONE]") bodySpent = true;
               if (!innerStr || innerStr === "[DONE]") continue;
 
               const inner = JSON.parse(innerStr);
@@ -818,6 +1203,12 @@ export function streamQoder(
             }
           }
         }
+
+        // Hand the socket back before re-submitting: undici will not pool a
+        // connection whose body was never drained, and a queued gateway usually
+        // closes it right after the notice anyway. A body that already errored
+        // makes cancel() reject, which is expected here.
+        if (retryQueued) await reader.cancel().catch(() => {});
       } while (retryQueued);
 
       if (thinkingParser) {

@@ -97,6 +97,28 @@ export function getQoderChatURL(mode?: string): string {
   return `${getQoderBaseUrl(mode)}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 }
 
+/**
+ * Queue-status endpoint, mirroring qodercli's `queueStatusPath()`:
+ *   /api/v2/service/ask/queue/status?requestSetId=&modelKey=&queueType=
+ *
+ * The `algo` prefix matches the other signed endpoints in this repo (the
+ * catalog, the chat SSE route); computeSigPath() strips it again when signing,
+ * which is what the gateway expects.
+ *
+ * While a chat request sits in the model queue, the client polls THIS instead
+ * of re-POSTing the conversation: the answer says whether the request is still
+ * queued, so a wait measured in minutes costs N tiny GETs instead of N full
+ * uploads of a potentially multi-megabyte body.
+ */
+export function getQoderQueueStatusURL(
+  mode: string | undefined,
+  params: { requestSetID: string; modelKey: string; queueType?: string },
+): string {
+  const query = new URLSearchParams({ requestSetId: params.requestSetID, modelKey: params.modelKey });
+  if (params.queueType) query.set("queueType", params.queueType);
+  return `${getQoderBaseUrl(mode)}algo/api/v2/service/ask/queue/status?${query.toString()}`;
+}
+
 export function getQoderExchangeURL(mode?: string): string {
   return `${getQoderOpenApiUrl(mode)}/api/v1/jobToken/exchange`;
 }

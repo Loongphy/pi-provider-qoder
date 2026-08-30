@@ -8,7 +8,7 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { setQoderUI, streamQoder } from "../stream.js";
+import { QODER_QUEUE_POLL_MAX_FAILURES, setQoderUI, streamQoder } from "../stream.js";
 
 /**
  * Build a single SSE `data:` line carrying a Qoder envelope:
@@ -110,6 +110,7 @@ describe("streamQoder", () => {
     vi.restoreAllMocks();
     setQoderUI(undefined);
     delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
+    delete process.env.QODER_QUEUE_POLL;
   });
 
   it("parses a successful SSE stream into text + stop", async () => {
@@ -311,6 +312,75 @@ describe("streamQoder", () => {
   }
 
   /**
+   * A queue-status poll reply. `undefined` body with the default status 404
+   * models a gateway that has no queue endpoint at all, which is the common
+   * case for tests that only care about the resend path.
+   */
+  type PollReply = Error | { body?: unknown; status?: number };
+
+  /**
+   * Route chat POSTs through `chat` (last entry reused) and queue-status GETs
+   * through `poll` (consumed in order, then the gateway is treated as having
+   * no queue endpoint). Counts the two separately so a test can prove how many
+   * times the conversation was uploaded versus how many times we just looked.
+   */
+  function mockFetchQueue(opts: { chat: Array<string | Response>; poll?: PollReply[] }) {
+    let posts = 0;
+    let gets = 0;
+    const getUrls: string[] = [];
+    const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/queue/status")) {
+        getUrls.push(url);
+        const reply = opts.poll?.[Math.min(gets, (opts.poll?.length ?? 1) - 1)] ?? { status: 404 };
+        gets++;
+        if (reply instanceof Error) throw reply;
+        return new Response(reply.body === undefined ? "" : JSON.stringify(reply.body), {
+          status: reply.status ?? 200,
+        });
+      }
+      const body = opts.chat[Math.min(posts, opts.chat.length - 1)];
+      posts++;
+      return typeof body === "string"
+        ? new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })
+        : body;
+    }) as unknown as typeof fetch;
+    return { fetch: fetchMock, posts: () => posts, gets: () => gets, getUrls };
+  }
+
+  /**
+   * An SSE body that is cut off the way undici reports a gateway hanging up:
+   * the bytes arrive, then the next `read()` rejects with `TypeError: terminated`.
+   */
+  function truncatedAfter(body: string): Response {
+    // Erroring a stream discards whatever is still queued, so the bytes have to
+    // go out on the first pull and the socket only dies on the next one.
+    const bytes = new TextEncoder().encode(body);
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(bytes);
+          return;
+        }
+        controller.error(new TypeError("terminated"));
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  /** A queue-status payload; nested in `data` because that is how the gateway answers. */
+  function queueStatus(inner: object): PollReply {
+    return { body: { data: inner } };
+  }
+
+  /** The status strings pushed to setWorkingMessage, in order (clears are undefined). */
+  function statusLines(spy: ReturnType<typeof vi.fn>): string[] {
+    return spy.mock.calls.map((c) => c[0]).filter((m): m is string => typeof m === "string");
+  }
+
+  /**
    * Build an SSE envelope carrying Qoder's triple-nested "queued" 403 notice:
    *   body = {"code":"403","message":"{\"code\":\"10605\",\"message\":\"<inner>\"}"}
    */
@@ -333,8 +403,13 @@ describe("streamQoder", () => {
   });
 
   it("retries when upstream returns a queued 403, then succeeds", async () => {
-    const fetchMock = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
-    globalThis.fetch = fetchMock;
+    // The queue frees up on the first look, so the conversation is uploaded
+    // exactly twice (original + resend) while the waiting is done by GET.
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [queueStatus({ isQueued: false, modelKey: "qmodel_preview", retryAfterSeconds: 0 })],
+    });
+    globalThis.fetch = route.fetch;
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     const events = await consume(stream);
 
@@ -344,9 +419,91 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("stop");
     const text = msg.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text : "").toBe("OK");
-    // First call hit the queue notice, second call served the real stream.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(route.posts()).toBe(2);
+    expect(route.gets()).toBe(1);
   });
+
+  it("does not fail the turn when the gateway hangs up right after the queue notice", async () => {
+    // The production failure: the gateway writes the 10605 notice and drops the
+    // socket, which undici surfaces as `TypeError: terminated`. The notice only
+    // broke out of the line loop, so the next read hit the dead body and the
+    // rejection escaped as an error event — the "Error: terminated" that shows
+    // up a few times before a queued request really resumes — throwing away the
+    // recoverable notice we had just parsed.
+    const route = mockFetchQueue({
+      chat: [truncatedAfter(QUEUED_SSE), SUCCESS_SSE],
+      poll: [queueStatus({ isQueued: false, modelKey: "qmodel_preview", retryAfterSeconds: 0 })],
+    });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(
+      events.find((e) => e.type === "error"),
+      "a dead socket after the notice is not a failure",
+    ).toBeUndefined();
+    const done = events.find((e) => e.type === "done");
+    expect(done, "the resend still happens").toBeDefined();
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("stop");
+    expect(route.posts()).toBe(2);
+  });
+
+  it("does not fail a complete answer when the socket dies after [DONE]", async () => {
+    const route = mockFetchQueue({ chat: [truncatedAfter(SUCCESS_SSE)] });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(
+      events.find((e) => e.type === "error"),
+      "the answer was complete",
+    ).toBeUndefined();
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
+    const text = (done as { message: AssistantMessage }).message.content.find((c) => c.type === "text");
+    expect(text && "text" in text ? text.text : "").toBe("OK");
+  });
+
+  it("still surfaces a truncated body when there was nothing to recover from", async () => {
+    // The safety net is scoped to a body that already told us it was over:
+    // a mid-answer truncation must stay an error, or the turn silently dies.
+    const partial = sseEnvelope(chunk({ content: "Hel", role: "assistant" }));
+    const route = mockFetchQueue({ chat: [truncatedAfter(partial)] });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "a truncated answer is still an error").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toBe("terminated");
+  });
+
+  it("ticks the countdown and the elapsed budget instead of freezing one line", async () => {
+    // The status line used to be rendered once per wait carrying the full hint
+    // and then left alone, so "retry in 30s" sat unchanged for 30 seconds and
+    // read as a hang.
+    process.env.QODER_QUEUE_POLL = "0";
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const route = mockFetchQueue({
+      chat: [
+        queueEnvelope({ isQueued: true, modelKey: "qmodel_preview", queueCount: 450, retryAfterSeconds: 2 }),
+        SUCCESS_SSE,
+      ],
+    });
+    globalThis.fetch = route.fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const lines = statusLines(setWorkingMessage);
+    expect(lines.some((m) => m.includes("retry in 2s"))).toBe(true);
+    expect(lines.some((m) => m.includes("retry in 1s"))).toBe(true);
+    expect(lines.some((m) => m.includes("retry in 0s"))).toBe(true);
+    // The elapsed side of the budget moves with it.
+    expect(lines.some((m) => m.includes("waited 0s/"))).toBe(true);
+    expect(lines.some((m) => m.includes("waited 2s/"))).toBe(true);
+    // The working row is a status line and ticks; stderr is a log and does not,
+    // so a long wait cannot turn into a per-second log flood.
+    const logged = errorSpy.mock.calls.filter((c) => String(c[0]).includes("pi-provider-qoder"));
+    expect(logged.length).toBeLessThan(lines.length);
+  }, 20_000);
 
   it("reports queue status via setWorkingMessage and clears it on success", async () => {
     const setWorkingMessage = vi.fn();
@@ -394,28 +551,146 @@ describe("streamQoder", () => {
   const REFUSED_FAST = { ...REFUSED_QUEUE_NOTICE, retryAfterSeconds: 0 };
 
   it("retries a 10605 notice that reports isQueued:false, then succeeds", async () => {
-    const fetchMock = mockFetchSequence([queueEnvelope(REFUSED_FAST), SUCCESS_SSE]);
-    globalThis.fetch = fetchMock;
+    const route = mockFetchQueue({
+      chat: [queueEnvelope(REFUSED_FAST), SUCCESS_SSE],
+      poll: [queueStatus({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0 })],
+    });
+    globalThis.fetch = route.fetch;
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     const events = await consume(stream);
 
     const done = events.find((e) => e.type === "done");
     expect(done, "expected a done event after retrying the refused-queue notice").toBeDefined();
     expect((done as { message: AssistantMessage }).message.stopReason).toBe("stop");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(route.posts()).toBe(2);
+  }, 20_000);
+
+  it("waits out a long queue by polling, re-uploading the conversation only once", async () => {
+    // The case the poll route exists for: several looks at the queue, and the
+    // multi-megabyte body goes out exactly twice (original + the real send).
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [
+        queueStatus({ isQueued: true, queueCount: 900, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: true, queueCount: 412, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: true, queueCount: 7, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: false, retryAfterSeconds: 0 }),
+      ],
+    });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "done")).toBeDefined();
+    expect(route.gets()).toBe(4);
+    expect(route.posts()).toBe(2);
+    // The position is re-read on every look, so it walks down instead of being
+    // frozen at whatever the first notice said. NOTE: the stale "position 489"
+    // from QUEUED_SSE is never shown once a poll answers.
+    const lines = statusLines(setWorkingMessage);
+    expect(lines.some((m) => m.includes("position 900"))).toBe(true);
+    expect(lines.some((m) => m.includes("position 412"))).toBe(true);
+    expect(lines.some((m) => m.includes("position 7"))).toBe(true);
+  }, 30_000);
+
+  it("keeps polling while serviceAvailable is false and only resends on a free slot", async () => {
+    const setWorkingMessage = vi.fn();
+    setQoderUI({ setWorkingMessage });
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [
+        queueStatus({ isQueued: true, serviceAvailable: false, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: false, retryAfterSeconds: 0 }),
+      ],
+    });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "done")).toBeDefined();
+    expect(route.gets()).toBe(2);
+    expect(route.posts()).toBe(2);
+    // A free slot is announced as a resend, not as another wait.
+    expect(statusLines(setWorkingMessage).some((m) => m.includes("slot free \u00B7 resending"))).toBe(true);
+  }, 30_000);
+
+  it("asks the queue endpoint with requestSetId, modelKey and queueType", async () => {
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [queueStatus({ isQueued: false, retryAfterSeconds: 0 })],
+    });
+    globalThis.fetch = route.fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(route.getUrls).toHaveLength(1);
+    const url = new URL(route.getUrls[0]);
+    expect(url.pathname).toBe("/algo/api/v2/service/ask/queue/status");
+    expect(url.searchParams.get("requestSetId")).toMatch(/^[0-9a-f]{16}$/);
+    // modelKey comes from the notice (qmodel_preview), not the pi model id.
+    expect(url.searchParams.get("modelKey")).toBe("qmodel_preview");
+    expect(url.searchParams.get("queueType")).toBe("slow");
+  });
+
+  it("degrades to a plain hint wait when the gateway has no queue endpoint", async () => {
+    // poll defaults to 404: a missing endpoint must not fail the turn.
+    const route = mockFetchQueue({ chat: [queueEnvelope(REFUSED_FAST), SUCCESS_SSE] });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(
+      events.find((e) => e.type === "done"),
+      "the resend still happens",
+    ).toBeDefined();
+    expect(route.gets()).toBe(1);
+    expect(route.posts()).toBe(2);
+  }, 20_000);
+
+  it("stops polling after three consecutive failures instead of looping forever", async () => {
+    const route = mockFetchQueue({
+      chat: [queueEnvelope(REFUSED_FAST), SUCCESS_SSE],
+      poll: [new Error("ECONNRESET"), new Error("ECONNRESET"), new Error("ECONNRESET")],
+    });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "done")).toBeDefined();
+    expect(route.gets()).toBe(QODER_QUEUE_POLL_MAX_FAILURES);
+    expect(route.posts()).toBe(2);
+  }, 30_000);
+
+  it("QODER_QUEUE_POLL=0 waits the hint and resends without touching the endpoint", async () => {
+    process.env.QODER_QUEUE_POLL = "0";
+    const route = mockFetchQueue({ chat: [queueEnvelope(REFUSED_FAST), SUCCESS_SSE] });
+    globalThis.fetch = route.fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "done")).toBeDefined();
+    expect(route.gets()).toBe(0);
+    expect(route.posts()).toBe(2);
   }, 20_000);
 
   it("honors the advertised retryAfterSeconds and labels a refused slot as busy", async () => {
     const setWorkingMessage = vi.fn();
     setQoderUI({ setWorkingMessage });
-    globalThis.fetch = mockFetchSequence([queueEnvelope(REFUSED_QUEUE_NOTICE), SUCCESS_SSE]);
+    const route = mockFetchQueue({
+      chat: [queueEnvelope(REFUSED_QUEUE_NOTICE), SUCCESS_SSE],
+      // The service is down on the first look, so the same 2s hint is slept as a
+      // queue LOOK; then the endpoint turns out to be absent (404) and the very
+      // same hint is slept again as the wait before the re-send.
+      poll: [queueStatus({ serviceAvailable: false, modelKey: "qfmodel", retryAfterSeconds: 2 }), { status: 404 }],
+    });
+    globalThis.fetch = route.fetch;
     await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const status = setWorkingMessage.mock.calls.map((c) => c[0]).find((m) => typeof m === "string");
-    expect(status).toContain("Busy on qfmodel");
-    expect(status).toContain("retry in 2s");
+    const lines = statusLines(setWorkingMessage);
+    expect(lines[0]).toContain("Busy on qfmodel");
+    // The hint is taken literally in both phases, not clamped to something
+    // shorter.
+    expect(lines.some((m) => m.includes("check again in 2s"))).toBe(true);
+    expect(lines.some((m) => m.includes("retry in 2s"))).toBe(true);
     // A queue position is meaningless when we were never queued.
-    expect(status).not.toContain("position");
+    expect(lines[0]).not.toContain("position");
+    expect(route.posts()).toBe(2);
   }, 20_000);
 
   it("waits 1s when the notice carries no retryAfterSeconds", async () => {
@@ -424,8 +699,11 @@ describe("streamQoder", () => {
     globalThis.fetch = mockFetchSequence([queueEnvelope({ isQueued: false, modelKey: "qfmodel" }), SUCCESS_SSE]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const status = setWorkingMessage.mock.calls.map((c) => c[0]).find((m) => typeof m === "string");
-    expect(status).toContain("retry in 1s");
+    const lines = statusLines(setWorkingMessage);
+    // The first line is the notice itself (the 30s poll default); the 1s
+    // fallback applies to the wait before the re-send.
+    expect(lines[0]).toContain("check again in 30s");
+    expect(lines.some((m) => m.includes("retry in 1s"))).toBe(true);
     expect(
       events.find((e) => e.type === "done"),
       "should recover after the fallback wait",
@@ -448,8 +726,8 @@ describe("streamQoder", () => {
       streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
     );
 
-    const status = setWorkingMessage.mock.calls.map((c) => c[0]).find((m) => typeof m === "string");
-    expect(status).toContain("retry in 120s");
+    const lines = statusLines(setWorkingMessage);
+    expect(lines.some((m) => m.includes("in 120s"))).toBe(true);
     const err = events.find((e) => e.type === "error") as { error: AssistantMessage } | undefined;
     expect(err?.error.stopReason, "the wait must stay interruptible").toBe("aborted");
   }, 15_000);
@@ -457,21 +735,21 @@ describe("streamQoder", () => {
   it("gives up with the original upstream error once the wall-clock budget is spent", async () => {
     // A tiny time budget instead of an attempt cap, matching the upstream knob.
     process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = "1200";
-    const alwaysQueued = queueEnvelope({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0.5 });
-    let attempts = 0;
-    const fetchMock = vi.fn(async () => {
-      attempts++;
-      return new Response(alwaysQueued, { status: 200 });
-    }) as unknown as typeof fetch;
-    globalThis.fetch = fetchMock;
+    const route = mockFetchQueue({
+      chat: [queueEnvelope({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0.5 })],
+      // Never frees up: polling burns the budget, then the last resend errors.
+      poll: [queueStatus({ isQueued: true, modelKey: "qfmodel", retryAfterSeconds: 0.5 })],
+    });
+    globalThis.fetch = route.fetch;
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
     const err = events.find((e) => e.type === "error");
     expect(err, "expected the queue notice to surface as an error after the budget").toBeDefined();
     expect((err as { error: AssistantMessage }).error.errorMessage).toMatch(/Upstream status 403/);
-    // 500ms hint against a 1200ms budget: a couple of re-submits, then stop.
-    expect(attempts).toBeGreaterThanOrEqual(2);
-    expect(attempts).toBeLessThanOrEqual(4);
+    // The budget stops the waiting, and the conversation is re-uploaded at most
+    // once more than it was sent to begin with.
+    expect(route.gets()).toBeGreaterThanOrEqual(2);
+    expect(route.posts()).toBe(2);
   }, 20_000);
 
   it("clears the working message when the retry budget is exhausted", async () => {
@@ -489,6 +767,7 @@ describe("streamQoder", () => {
   }, 20_000);
 
   it("retries when the notice arrives as a real HTTP 403 instead of an SSE envelope", async () => {
+    process.env.QODER_QUEUE_POLL = "0";
     let call = 0;
     const fetchMock = vi.fn(async () => {
       call++;
@@ -526,7 +805,10 @@ describe("streamQoder", () => {
     const bodies: Buffer[] = [];
     const auths: string[] = [];
     let call = 0;
-    globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    globalThis.fetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes("/queue/status")) {
+        return new Response(JSON.stringify({ data: { isQueued: false, retryAfterSeconds: 0 } }), { status: 200 });
+      }
       bodies.push(Buffer.from(init?.body as ArrayBuffer));
       const headers = init?.headers as Record<string, string>;
       auths.push(`${headers.Authorization}|${headers["X-Request-Id"]}`);
