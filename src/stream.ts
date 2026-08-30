@@ -3,6 +3,7 @@ import * as PiAi from "@earendil-works/pi-ai";
 import {
   type Api,
   type AssistantMessage,
+  type AssistantMessageEvent,
   type AssistantMessageEventStream,
   type Context,
   clampThinkingLevel,
@@ -211,6 +212,89 @@ function clearQoderQueueStatus(): void {
   } catch {}
 }
 
+/**
+ * Anything that accepts stream events. `AssistantMessageEventStream` satisfies
+ * it structurally, and so does the coalescing emitter below.
+ */
+type QoderEventSink = { push(event: AssistantMessageEvent): void };
+
+const DELTA_EVENT_TYPES = ["thinking_delta", "text_delta", "toolcall_delta"] as const;
+type DeltaEventType = (typeof DELTA_EVENT_TYPES)[number];
+type DeltaEvent = Extract<AssistantMessageEvent, { type: DeltaEventType }>;
+
+/**
+ * Coalesce consecutive content deltas before they reach pi.
+ *
+ * Qoder's SSE chunks are tiny — measured against the live gateway: ~4.8
+ * characters per delta at 29-53 deltas/s, roughly 2-3x finer than what
+ * pi's own providers typically deliver. Every content delta becomes a
+ * `message_update` that pi handles by rebuilding the streaming assistant
+ * component (clear + re-parse the whole accumulated block as Markdown) and
+ * scheduling a render, so the cost per update grows with the answer and the
+ * UI thread saturates: in a large session, event-loop delay measured
+ * p99 ~28-34ms at Qoder's rate versus ~13ms for a coarser provider, which is
+ * what users feel as a stuttering TUI.
+ *
+ * Merging deltas that belong to the same block keeps the delivered text
+ * identical while cutting the update count to at most one per `flushMs`, so pi
+ * re-renders on its own ~16ms frame budget instead of on every wire chunk.
+ * Structural events (start/end/done/error) flush first, so ordering — and
+ * therefore the consumer's block state machine — is unchanged.
+ */
+function createQoderDeltaEmitter(target: QoderEventSink, flushMs: number): QoderEventSink & { flush(): void } {
+  let pending: DeltaEvent | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const flush = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (!pending) return;
+    const event = pending;
+    pending = null;
+    target.push(event);
+  };
+
+  return {
+    push(event: AssistantMessageEvent): void {
+      if (flushMs <= 0 || !DELTA_EVENT_TYPES.includes(event.type as DeltaEventType)) {
+        flush();
+        target.push(event);
+        return;
+      }
+      const delta = event as DeltaEvent;
+      if (pending && pending.type === delta.type && pending.contentIndex === delta.contentIndex) {
+        pending.delta += delta.delta;
+        // Keep memory and end-of-stream latency bounded on a burst.
+        if (pending.delta.length >= QODER_MAX_COALESCED_CHARS) flush();
+        return;
+      }
+      flush();
+      pending = { ...delta, delta: delta.delta };
+      timer = setTimeout(flush, flushMs);
+      // A pending flush must never hold the process open.
+      timer.unref?.();
+    },
+    flush,
+  };
+}
+
+/** Upper bound on a merged delta, so a long burst is still bounded. */
+const QODER_MAX_COALESCED_CHARS = 2048;
+
+/**
+ * Merge window in ms. 40ms means at most ~25 content updates/s — still well
+ * above what reads as smooth streaming, and ~2x fewer updates than the wire
+ * rate. `QODER_STREAM_FLUSH_MS=0` restores per-chunk passthrough.
+ */
+function qoderStreamFlushMs(): number {
+  const raw = process.env.QODER_STREAM_FLUSH_MS;
+  if (raw === undefined || raw.trim() === "") return 40;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, 1000) : 40;
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: Context,
@@ -237,6 +321,11 @@ export function streamQoder(
     stopReason: "stop",
     timestamp: Date.now(),
   };
+
+  // Merge Qoder's fine-grained wire chunks into at most one content delta per
+  // window, so pi rebuilds/renders the streaming message on its own frame
+  // budget rather than on every SSE envelope. See createQoderDeltaEmitter.
+  const emitter = createQoderDeltaEmitter(stream, qoderStreamFlushMs());
 
   (async () => {
     try {
@@ -441,7 +530,7 @@ export function streamQoder(
       const toolCallsState: ToolCallState[] = [];
 
       const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
-      const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+      const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, emitter) : null;
 
       do {
         retryQueued = false;
@@ -517,7 +606,7 @@ export function streamQoder(
               if (!streamStarted) {
                 streamStarted = true;
                 clearQoderQueueStatus();
-                stream.push({ type: "start", partial: output });
+                emitter.push({ type: "start", partial: output });
               }
 
               const innerStr = envelope.body;
@@ -572,11 +661,11 @@ export function streamQoder(
                       if (thinkingBlockIndex === -1) {
                         thinkingBlockIndex = output.content.length;
                         output.content.push({ type: "thinking", thinking: "" });
-                        stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+                        emitter.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
                       }
                       const block = output.content[thinkingBlockIndex] as ThinkingContent;
                       block.thinking += reasoningChunk;
-                      stream.push({
+                      emitter.push({
                         type: "thinking_delta",
                         contentIndex: thinkingBlockIndex,
                         delta: reasoningChunk,
@@ -590,7 +679,7 @@ export function streamQoder(
                     // End API thinking block if active
                     if (thinkingBlockIndex !== -1) {
                       const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                      stream.push({
+                      emitter.push({
                         type: "thinking_end",
                         contentIndex: thinkingBlockIndex,
                         content: block.thinking,
@@ -605,11 +694,11 @@ export function streamQoder(
                       if (contentBlockIndex === -1) {
                         contentBlockIndex = output.content.length;
                         output.content.push({ type: "text", text: "" });
-                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+                        emitter.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
                       }
                       const block = output.content[contentBlockIndex] as TextContent;
                       block.text += delta.content;
-                      stream.push({
+                      emitter.push({
                         type: "text_delta",
                         contentIndex: contentBlockIndex,
                         delta: delta.content,
@@ -647,7 +736,7 @@ export function streamQoder(
                           name: state.name,
                           arguments: {},
                         } satisfies ToolCall);
-                        stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                        emitter.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
                       }
 
                       // id and name can arrive after the block is open; keep it
@@ -661,7 +750,7 @@ export function streamQoder(
                       if (tc.function?.arguments) {
                         const argDelta = tc.function.arguments;
                         state.arguments += argDelta;
-                        stream.push({
+                        emitter.push({
                           type: "toolcall_delta",
                           contentIndex: state.contentIndex,
                           delta: argDelta,
@@ -700,7 +789,7 @@ export function streamQoder(
 
       if (thinkingBlockIndex !== -1) {
         const block = output.content[thinkingBlockIndex] as ThinkingContent;
-        stream.push({
+        emitter.push({
           type: "thinking_end",
           contentIndex: thinkingBlockIndex,
           content: block.thinking,
@@ -717,7 +806,7 @@ export function streamQoder(
           } catch {}
           const block = output.content[state.contentIndex] as ToolCall;
           block.arguments = args;
-          stream.push({
+          emitter.push({
             type: "toolcall_end",
             contentIndex: state.contentIndex,
             toolCall: {
@@ -740,7 +829,7 @@ export function streamQoder(
       // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
       // Never overwrite a meaningful finish_reason ("length", "content_filter",
       // ...) with "stop".
-      stream.push({
+      emitter.push({
         type: "done",
         reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
         message: output,
@@ -750,7 +839,7 @@ export function streamQoder(
       clearQoderQueueStatus();
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
-      stream.push({ type: "error", reason: output.stopReason, error: output });
+      emitter.push({ type: "error", reason: output.stopReason, error: output });
       try {
         stream.end();
       } catch {}

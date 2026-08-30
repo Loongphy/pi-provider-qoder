@@ -1,9 +1,4 @@
-import type {
-  AssistantMessage,
-  AssistantMessageEventStream,
-  TextContent,
-  ThinkingContent,
-} from "@earendil-works/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent } from "@earendil-works/pi-ai";
 
 export const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
   { open: "<thinking>", close: "</thinking>" },
@@ -58,7 +53,9 @@ export class ThinkingTagParser {
 
   constructor(
     private output: AssistantMessage,
-    private stream: AssistantMessageEventStream,
+    // Structural sink rather than AssistantMessageEventStream: the stream layer
+    // may hand us a delta-coalescing wrapper instead of the raw pi stream.
+    private stream: { push(event: AssistantMessageEvent): void },
   ) {}
 
   processChunk(chunk: string): void {

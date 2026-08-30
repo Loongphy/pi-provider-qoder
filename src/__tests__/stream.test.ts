@@ -504,3 +504,88 @@ describe("streamQoder", () => {
     expect(Buffer.compare(first, new TextEncoder().encode(bodies[1]))).not.toBe(0);
   }, 20_000);
 });
+
+describe("delta coalescing", () => {
+  const originalFetch = globalThis.fetch;
+  const originalFlush = process.env.QODER_STREAM_FLUSH_MS;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalFlush === undefined) delete process.env.QODER_STREAM_FLUSH_MS;
+    else process.env.QODER_STREAM_FLUSH_MS = originalFlush;
+    vi.restoreAllMocks();
+    setQoderUI(undefined);
+  });
+
+  /** `count` SSE chunks each carrying the same small piece of text. */
+  function manyTextChunks(count: number, piece: string): string {
+    let sse = "";
+    for (let i = 0; i < count; i++) sse += sseEnvelope(chunk({ content: piece, role: "assistant" }));
+    return sse + sseEnvelope(finishChunk("stop")) + DONE_SSE;
+  }
+
+  it("merges Qoder's fine-grained text chunks into one update without losing characters", async () => {
+    process.env.QODER_STREAM_FLUSH_MS = "50";
+    globalThis.fetch = mockFetch(manyTextChunks(6, "ab"));
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const textDeltas = events.filter((e) => e.type === "text_delta");
+    expect(textDeltas.length, "6 wire chunks should collapse into one update").toBe(1);
+    expect((textDeltas[0] as { delta: string }).delta).toBe("abababababab");
+
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage };
+    const text = done.message.content.find((c) => c.type === "text");
+    expect(text && "text" in text ? text.text : "").toBe("abababababab");
+  });
+
+  it("QODER_STREAM_FLUSH_MS=0 restores per-chunk passthrough", async () => {
+    process.env.QODER_STREAM_FLUSH_MS = "0";
+    globalThis.fetch = mockFetch(manyTextChunks(6, "ab"));
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.filter((e) => e.type === "text_delta").length).toBe(6);
+  });
+
+  it("flushes a pending delta before structural events so ordering survives", async () => {
+    process.env.QODER_STREAM_FLUSH_MS = "50";
+    const sse =
+      sseEnvelope(chunk({ reasoning_content: "th", role: "assistant" })) +
+      sseEnvelope(chunk({ reasoning_content: "in", role: "assistant" })) +
+      sseEnvelope(chunk({ content: "te", role: "assistant" })) +
+      sseEnvelope(chunk({ content: "xt", role: "assistant" })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.map((e) => e.type)).toEqual([
+      "start",
+      "thinking_start",
+      "thinking_delta",
+      "thinking_end",
+      "text_start",
+      "text_delta",
+      "done",
+    ]);
+    const done = events[events.length - 1] as { message: AssistantMessage };
+    expect(done.message.content.map((c) => ("thinking" in c ? c.thinking : "text" in c ? c.text : ""))).toEqual([
+      "thin",
+      "text",
+    ]);
+  });
+
+  it("caps a merged delta so a long burst stays bounded", async () => {
+    process.env.QODER_STREAM_FLUSH_MS = "5000";
+    const piece = "x".repeat(500);
+    globalThis.fetch = mockFetch(manyTextChunks(12, piece));
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const textDeltas = events.filter((e) => e.type === "text_delta");
+    // 6000 chars against the merge cap needs more than one flush even with a
+    // huge window, so a stuck timer cannot grow one event without bound.
+    expect(textDeltas.length).toBeGreaterThan(1);
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage };
+    const text = done.message.content.find((c) => c.type === "text");
+    expect(text && "text" in text ? text.text.length : 0).toBe(6000);
+  }, 20_000);
+});
