@@ -93,8 +93,27 @@ export function setQoderUI(ui: QoderWorkingUI | undefined): void {
   qoderUI = ui;
 }
 
-/** Maximum number of times we re-submit while the upstream keeps us queued. */
-const QODER_MAX_QUEUE_RETRIES = 60;
+/**
+ * How long we keep re-submitting while the upstream keeps us queued.
+ *
+ * A wall-clock budget rather than an attempt count, like qodercli's
+ * QODER_MODEL_QUEUE_MAX_WAIT_MS (default 36e5 = 1h). We default lower on
+ * purpose: qodercli spends its wait polling a cheap queue-status endpoint
+ * (/api/v2/service/ask/queue/status), while every one of our waits ends in a
+ * full re-POST of the conversation. Set QODER_MODEL_QUEUE_MAX_WAIT_MS to match
+ * the upstream hour if you want it. This budget is also what bounds an
+ * unusually large retryAfterSeconds hint.
+ */
+const QODER_QUEUE_MAX_WAIT_MS_DEFAULT = 600_000;
+
+function qoderQueueMaxWaitMs(): number {
+  const raw = process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return QODER_QUEUE_MAX_WAIT_MS_DEFAULT;
+}
 
 interface QoderQueueInfo {
   isQueued?: boolean;
@@ -146,15 +165,29 @@ function parseQoderQueueInfo(bodyStr: string): QoderQueueInfo | null {
 }
 
 /**
- * How long to wait before re-submitting, per the upstream hint. An explicit
- * 0 is honored (immediate retry); a missing hint falls back to 30s when we are
- * actually queued and 5s when we were refused a queue slot. Clamped so one
- * absurdly large hint cannot exceed the whole retry budget by itself.
+ * How long to wait before re-submitting: exactly what the notice asked for.
+ *
+ * `retryAfterSeconds` is the upstream's own "come back at T" hint, so it is
+ * honored as-is, with no clamp. qodercli bounds it into [500ms, 30s] via
+ * `Can()`, but those are throttle limits for its cheap queue-status POLL;
+ * imposing them here would re-POST the whole conversation early whenever the
+ * hint exceeds 30s, and add pointless latency whenever it is shorter.
+ *
+ * Two guards only:
+ * - a 100ms anti-spin floor, so a 0/negative hint cannot turn the retry budget
+ *   into a tight loop of full-conversation uploads;
+ * - 1s when the notice carries no usable hint at all (not observed in
+ *   practice: both the queued and the refused-a-slot shapes send the field).
+ *
+ * The wall-clock budget applied by the caller is what bounds an absurdly large
+ * hint.
  */
-function qoderQueueRetrySeconds(queueInfo: QoderQueueInfo): number {
+function qoderQueueRetryMs(queueInfo: QoderQueueInfo): number {
   const advertised = queueInfo.retryAfterSeconds;
-  const sec = typeof advertised === "number" && Number.isFinite(advertised) ? advertised : queueInfo.isQueued ? 30 : 5;
-  return Math.min(Math.max(sec, 0), 120);
+  if (typeof advertised === "number" && Number.isFinite(advertised)) {
+    return Math.max(100, advertised * 1000);
+  }
+  return 1_000;
 }
 
 function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
@@ -190,14 +223,16 @@ function formatQoderDuration(totalSeconds: number): string {
  * Report queue status both to stderr (for logs / non-TUI modes) and to the pi
  * interactive working row via setWorkingMessage.
  */
-function reportQoderQueueStatus(queueInfo: QoderQueueInfo, attempt: number, maxRetries: number): void {
-  const waitSec = qoderQueueRetrySeconds(queueInfo);
+function reportQoderQueueStatus(queueInfo: QoderQueueInfo, waitedMs: number, maxWaitMs: number): void {
+  const waitSec = +(qoderQueueRetryMs(queueInfo) / 1000).toFixed(1);
   const estSec = Math.round((queueInfo.waitTime || 0) / 1000);
   const parts: string[] = [`${queueInfo.isQueued ? "Queued" : "Busy"} on ${queueInfo.modelKey || "model"}`];
   if (queueInfo.isQueued && queueInfo.queueCount != null) parts.push(`position ${queueInfo.queueCount}`);
   if (queueInfo.queueType) parts.push(`${queueInfo.queueType} queue`);
   if (estSec > 0) parts.push(`est. wait ~${formatQoderDuration(estSec)}`);
-  parts.push(`retry in ${waitSec}s (${attempt}/${maxRetries})`);
+  parts.push(
+    `retry in ${waitSec}s (waited ${formatQoderDuration(waitedMs / 1000)}/${formatQoderDuration(maxWaitMs / 1000)})`,
+  );
   const msg = parts.join(" \u00B7 ");
   console.error(`[pi-provider-qoder] ${msg}`);
   try {
@@ -487,21 +522,17 @@ export function streamQoder(
       const cosyCreds = { userID, authToken: accessToken, name, email, machineID };
 
       /**
-       * Encode the request for one attempt. Retries MUST carry a fresh
-       * `request_id`/`is_retry` and a freshly signed COSY header set: the
-       * signature covers a unix timestamp, so reusing the headers captured
-       * before a multi-second queue wait risks a replay/expiry rejection, and
-       * reusing the upstream `request_id` risks the gateway treating the retry
-       * as a duplicate. `chat_record_id`/`request_set_id`/`session_id` stay
-       * stable so prompt-cache and conversation affinity survive the retry.
+       * The body is encoded ONCE and re-sent verbatim on a queue retry, which is
+       * what qodercli does: `request_id`/`chat_record_id` are minted per request
+       * build (never rotated per retry) and `is_retry` is a constant `false` in
+       * its body builder -- the "is_retry" elsewhere in that bundle is telemetry,
+       * not the wire field. All a retry needs is a fresh signature: the COSY sig
+       * covers a unix timestamp, and qodercli likewise runs prepareRequest() for
+       * every HTTP attempt, so a request that waited 30s is signed at send time.
        */
-      const prepareAttempt = (isRetry: boolean) => {
-        reqBody.request_id = crypto.randomUUID();
-        reqBody.is_retry = isRetry;
-        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-        const encodedBytes = Buffer.from(qoderEncodeBody(bodyBytes), "utf8");
-        return { body: encodedBytes, headers: buildAuthHeaders(encodedBytes, chatURL, cosyCreds) };
-      };
+      const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+      const encodedBytes = Buffer.from(qoderEncodeBody(bodyBytes), "utf8");
+      const signAttempt = () => buildAuthHeaders(encodedBytes, chatURL, cosyCreds);
 
       const modelSource = modelConfig.source || "system";
 
@@ -509,18 +540,25 @@ export function streamQoder(
       // envelope so that queue retries (which re-issue the request before any
       // content is produced) do not emit a premature start.
       let streamStarted = false;
-      let queueRetries = 0;
+      let queueWaitStartedAt = 0;
       let retryQueued = false;
 
       // Retrying is only safe before anything reached the consumer: once a
       // block (text/thinking/tool call) exists, a re-submit would duplicate it.
-      const canRetryQueue = (): boolean =>
-        !streamStarted && output.content.length === 0 && queueRetries < QODER_MAX_QUEUE_RETRIES;
+      const canRetryQueue = (): boolean => !streamStarted && output.content.length === 0;
+
+      // Wall-clock budget instead of an attempt cap, like the upstream CLI.
+      const queueBudgetSpent = (): boolean =>
+        queueWaitStartedAt > 0 && Date.now() - queueWaitStartedAt >= qoderQueueMaxWaitMs();
 
       const doQueueRetry = async (queueInfo: QoderQueueInfo): Promise<void> => {
-        queueRetries++;
-        reportQoderQueueStatus(queueInfo, queueRetries, QODER_MAX_QUEUE_RETRIES);
-        await sleepMs(qoderQueueRetrySeconds(queueInfo) * 1000, options?.signal);
+        const maxWaitMs = qoderQueueMaxWaitMs();
+        if (queueWaitStartedAt === 0) queueWaitStartedAt = Date.now();
+        const waitedMs = Date.now() - queueWaitStartedAt;
+        reportQoderQueueStatus(queueInfo, waitedMs, maxWaitMs);
+        // Never sleep past the budget: either we resume inside it, or the next
+        // notice finds it spent and surfaces the upstream error.
+        await sleepMs(Math.min(qoderQueueRetryMs(queueInfo), Math.max(0, maxWaitMs - waitedMs)), options?.signal);
         retryQueued = true;
       };
 
@@ -534,7 +572,6 @@ export function streamQoder(
 
       do {
         retryQueued = false;
-        const attempt = prepareAttempt(queueRetries > 0);
         const response = await fetch(chatURL, {
           method: "POST",
           headers: {
@@ -544,9 +581,9 @@ export function streamQoder(
             "Accept-Encoding": "identity",
             "X-Model-Key": qoderModel,
             "X-Model-Source": modelSource,
-            ...attempt.headers,
+            ...signAttempt(),
           },
-          body: attempt.body,
+          body: encodedBytes,
           signal: options?.signal,
         });
 
@@ -555,7 +592,7 @@ export function streamQoder(
           // The same back-pressure notice can arrive as a real HTTP status
           // instead of an SSE envelope; only a genuine 10605 is retryable.
           const httpQueueInfo = response.status === 403 ? parseQoderQueueInfo(errText) : null;
-          if (httpQueueInfo && canRetryQueue()) {
+          if (httpQueueInfo && canRetryQueue() && !queueBudgetSpent()) {
             await doQueueRetry(httpQueueInfo);
             continue;
           }
@@ -596,7 +633,7 @@ export function streamQoder(
                 // isQueued:true (in the slow queue) and isQueued:false
                 // (refused a slot, "come back in N seconds").
                 const queueInfo = parseQoderQueueInfo(envelope.body);
-                if (queueInfo && canRetryQueue()) {
+                if (queueInfo && canRetryQueue() && !queueBudgetSpent()) {
                   await doQueueRetry(queueInfo);
                   break;
                 }
