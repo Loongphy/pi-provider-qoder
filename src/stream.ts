@@ -353,17 +353,8 @@ function formatQoderQueueMessage(
   return parts.join(" \u00B7 ");
 }
 
-/**
- * Report queue status to the dedicated widget row above the editor, and to
- * stderr when logging is enabled.
- *
- * The two sinks are deliberately decoupled: the widget is a status line and is
- * safe to rewrite every second, while stderr is a log that is throttled and,
- * critically, must never be attached to pi's TUI (see ui.ts for why any
- * console.error during streaming smears the whole screen).
- */
-function reportQoderQueueStatus(message: string, opts: { log: boolean }): void {
-  if (opts.log) qoderLog(message);
+/** Show one queue-status line on the dedicated status row above the editor. */
+function reportQoderQueueStatus(message: string): void {
   reportQueueStatus(message);
 }
 
@@ -692,11 +683,6 @@ export function streamQoder(
        * requestRender per second is free.
        */
       const QUEUE_TICK_MS = 1_000;
-      /** stderr is not a status line: only log on a real change, or heartbeat. */
-      const QUEUE_LOG_MIN_INTERVAL_MS = 15_000;
-
-      let lastLogKey = "";
-      let lastLoggedAt = 0;
 
       /**
        * The pi-visible model name for an upstream key -- what /model shows
@@ -717,10 +703,12 @@ export function streamQoder(
       };
 
       /**
-       * Push one status line to the working row. The stderr copy is written only
-       * when the line actually says something new (phase or position moved) or
-       * every QUEUE_LOG_MIN_INTERVAL_MS, so a long wait is not silent without
-       * turning the log into a countdown.
+       * Push one status line to the dedicated status row above the editor.
+       *
+       * There is deliberately no stderr copy: the row IS the log, and any
+       * console.error while pi's TUI renders corrupts the screen (see ui.ts).
+       * Queued waits are diagnosed from the row, or from QODER_LOG=1 with
+       * stderr redirected to a file.
        */
       const renderQueue = (info: QoderQueueInfo, phase: QoderQueuePhase, remainingMs: number): void => {
         const message = formatQoderQueueMessage(
@@ -731,14 +719,7 @@ export function streamQoder(
           phase,
           remainingMs,
         );
-        const key = `${phase}|${info.isQueued}|${info.queueCount ?? ""}|${info.serviceAvailable}`;
-        const now = Date.now();
-        const log = key !== lastLogKey || now - lastLoggedAt >= QUEUE_LOG_MIN_INTERVAL_MS;
-        if (log) {
-          lastLogKey = key;
-          lastLoggedAt = now;
-        }
-        reportQoderQueueStatus(message, { log });
+        reportQoderQueueStatus(message);
       };
 
       /**

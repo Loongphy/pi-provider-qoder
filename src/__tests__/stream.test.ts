@@ -8,6 +8,9 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { QODER_QUEUE_POLL_MAX_FAILURES, streamQoder } from "../stream.js";
 import { setQoderUI } from "../ui.js";
 
@@ -167,10 +170,16 @@ async function consume(stream: AssistantMessageEventStream): Promise<AssistantMe
 
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
+  let stateDir = "";
   beforeEach(() => {
     // Vitest's stderr is a pipe, so qoderLog would default to on here; keep
     // the suite quiet unless a test opts in explicitly.
     process.env.QODER_LOG = "0";
+    // The queue handshake files must never touch the real ~/.pi/agent.
+    stateDir = mkdtempSync(join(tmpdir(), "qoder-ui-test-"));
+    process.env.PI_AGENT_DIR = stateDir;
+    // Mount the fallback row immediately unless a test wants the grace path.
+    process.env.QODER_QUEUE_YIELD_GRACE_MS = "0";
   });
   afterEach(() => {
     globalThis.fetch = originalFetch;
@@ -179,6 +188,9 @@ describe("streamQoder", () => {
     delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
     delete process.env.QODER_QUEUE_POLL;
     delete process.env.QODER_LOG;
+    delete process.env.PI_AGENT_DIR;
+    delete process.env.QODER_QUEUE_YIELD_GRACE_MS;
+    rmSync(stateDir, { recursive: true, force: true });
   });
 
   it("parses a successful SSE stream into text + stop", async () => {
@@ -619,6 +631,83 @@ describe("streamQoder", () => {
     expect(widget.isVisible()).toBe(false);
   }, 30_000);
 
+  it("publishes the queue line to the handshake file and yields to a widget host", async () => {
+    // A widget host (the user's status extension) that claims the queue row
+    // renders it ABOVE "Working for"; the provider must then stand its own
+    // row down so the line is not duplicated, and clean the file up at the end.
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
+    const claimPath = join(stateDir, `qoder-queue-${process.pid}.claim`);
+    writeFileSync(claimPath, String(Date.now()));
+    const statePath = join(stateDir, `qoder-queue-${process.pid}.json`);
+
+    let sawPublishedLine = false;
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [
+        queueStatus({ isQueued: true, queueCount: 412, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: false, retryAfterSeconds: 0 }),
+      ],
+    });
+    const innerFetch = route.fetch;
+    globalThis.fetch = (async (url: URL, init?: RequestInit) => {
+      const response = await innerFetch(url, init);
+      // While the provider is mid-wait, the published line must be on disk.
+      try {
+        const raw = JSON.parse(readFileSync(statePath, "utf8")) as { line?: string };
+        if (typeof raw.line === "string" && raw.line.includes("Queued on qmodel_preview")) {
+          sawPublishedLine = true;
+        }
+      } catch {
+        // not written yet
+      }
+      return response;
+    }) as unknown as typeof fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(sawPublishedLine, "the queue line was published for widget hosts").toBe(true);
+    expect(widget.lines(), "the host claimed it, so no duplicate fallback row").toEqual([]);
+    expect(widget.workingMessages()).toEqual([]);
+    expect(() => statSync(statePath), "the handshake file is cleaned up once the queue clears").toThrow();
+  }, 30_000);
+
+  it("keeps the fallback row when no widget host claims the queue display", async () => {
+    // Standalone installs (no status extension): after the grace period the
+    // provider renders the row itself, below the working row.
+    process.env.QODER_QUEUE_YIELD_GRACE_MS = "0";
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [queueStatus({ isQueued: false, retryAfterSeconds: 0 })],
+    });
+    globalThis.fetch = route.fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(widget.mounts()).toBe(1);
+    expect(widget.lines().some((m) => m.includes("Queued on qmodel_preview"))).toBe(true);
+  }, 30_000);
+
+  it("delays the fallback row during the yield grace period", async () => {
+    // The grace window exists so a widget host can claim the row first; with
+    // a long grace and no host, the row appears only after it elapses.
+    process.env.QODER_QUEUE_YIELD_GRACE_MS = "5000";
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [
+        queueStatus({ isQueued: true, queueCount: 412, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: false, retryAfterSeconds: 0 }),
+      ],
+    });
+    globalThis.fetch = route.fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    // The episode lasts ~1s (two 500ms waits), well inside the 5s grace.
+    expect(widget.lines()).toEqual([]);
+  }, 30_000);
+
   it("re-mounts the widget after a session switch disposed it", async () => {
     const widget = widgetUI();
     setQoderUI(widget.ui);
@@ -648,11 +737,18 @@ describe("streamQoder", () => {
       await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
       expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("pi-provider-qoder"))).toEqual([]);
 
-      // Opt-in logging still works.
+      // Opt-in logging still works for real diagnostics (not for the status
+      // line itself, which is a UI row now).
       process.env.QODER_LOG = "1";
-      globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+      const route = mockFetchQueue({
+        chat: [queueEnvelope(REFUSED_FAST), SUCCESS_SSE],
+        poll: [new Error("ECONNRESET"), new Error("ECONNRESET"), new Error("ECONNRESET")],
+      });
+      globalThis.fetch = route.fetch;
       await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
-      expect(errorSpy.mock.calls.some((c) => String(c[0]).includes("[pi-provider-qoder] Queued on"))).toBe(true);
+      expect(
+        errorSpy.mock.calls.some((c) => String(c[0]).includes("[pi-provider-qoder] queue status polling disabled")),
+      ).toBe(true);
     } finally {
       if (stderrDesc) Object.defineProperty(process.stderr, "isTTY", stderrDesc);
       else delete (process.stderr as { isTTY?: boolean }).isTTY;

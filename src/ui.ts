@@ -1,7 +1,7 @@
 /**
  * Safe UI surface for the streaming layer.
  *
- * Two rules learned the hard way:
+ * Three rules learned the hard way:
  *
  * 1. NEVER write to stderr while pi's interactive TUI owns the terminal.
  *
@@ -25,7 +25,32 @@
  *    half of the reported bug. Queue status therefore gets its own dedicated
  *    widget line above the editor (below the working row, pi has no slot above
  *    it), rendered as exactly one truncated line so its height never changes.
+ *
+ * 3. Publish the queue line for a widget host that can render it ABOVE
+ *    "Working for".
+ *
+ *    pi renders extension widgets BELOW its working loader, so "above Working
+ *    for" is only reachable if a status widget takes the row over while we are
+ *    queued. The handshake is two PID-scoped files in the pi agent directory
+ *    (both extensions live in one process, so the pid scopes them to this pi
+ *    instance and keeps concurrent pi processes out of each other's hair):
+ *
+ *      qoder-queue-<pid>.json   we write { line, ts } here every status tick
+ *                               and unlink it when the queue clears. Consumers
+ *                               ignore lines older than 5s (crash leftovers).
+ *      qoder-queue-<pid>.claim  a rendering host touches this while it is
+ *                               displaying the queue row; fresh mtime (<=3s)
+ *                               means "I've got it" and we stand our own widget
+ *                               row down so the line is not duplicated.
+ *
+ *    With no host (no status extension, non-interactive mode), we render the
+ *    fallback row ourselves after a short grace period that gives a host time
+ *    to claim first.
  */
+
+import { mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 /** The part of pi's TUI a widget factory needs. Structural, not imported. */
 export interface QoderTui {
@@ -64,11 +89,30 @@ const QUEUE_WIDGET_KEY = "qoder-queue";
 /** Leading column, matching pi's own Text widgets (paddingX = 1). */
 const QUEUE_WIDGET_PAD_X = 1;
 
+/**
+ * How long we wait before rendering our own fallback row, so a widget host
+ * (the user's status extension) can claim the queue row first and render it
+ * above "Working for". Only matters when a host exists; without one this is
+ * the entire delay before the row appears.
+ */
+function queueWidgetGraceMs(): number {
+  const raw = process.env.QODER_QUEUE_YIELD_GRACE_MS;
+  if (raw !== undefined && raw.trim() !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) return Math.min(parsed, 10_000);
+  }
+  return 1_200;
+}
+
 let statusUI: QoderStatusUI | undefined;
 let widgetMounted = false;
 let widgetTui: QoderTui | undefined;
 let widgetTheme: QoderTheme | undefined;
 let statusLine: string | undefined;
+/** Set on the first status of a queue episode; reset when the queue clears. */
+let episodeStartAt = 0;
+/** True once we degraded to setWorkingMessage (old pi without setWidget). */
+let usingWorkingMessageFallback = false;
 /**
  * Increments per mount so a stale component's dispose (pi disposes the old
  * widget before creating the new one when the same key is re-mounted) cannot
@@ -76,15 +120,52 @@ let statusLine: string | undefined;
  */
 let widgetGeneration = 0;
 
+/** The pi agent directory; PI_AGENT_DIR overrides (tests, custom layouts). */
+function agentDir(): string {
+  return process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+/** Both extensions run in one process, so the pid scopes the handshake. */
+function queueStatePath(): string {
+  return join(agentDir(), `qoder-queue-${process.pid}.json`);
+}
+
+function queueClaimPath(): string {
+  return join(agentDir(), `qoder-queue-${process.pid}.claim`);
+}
+
+/** A host that touched its claim recently is rendering the queue row. */
+function consumerActive(): boolean {
+  try {
+    return Date.now() - statSync(queueClaimPath()).mtimeMs < 3_000;
+  } catch {
+    return false;
+  }
+}
+
+/** Publish the current line for widget hosts. Atomic replace, ~100 bytes/tick. */
+function publishQueueLine(line: string): void {
+  try {
+    mkdirSync(agentDir(), { recursive: true });
+    const file = queueStatePath();
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ line, ts: Date.now() }));
+    renameSync(tmp, file);
+  } catch {}
+}
+
+function unpublishQueueLine(): void {
+  try {
+    rmSync(queueStatePath(), { force: true });
+  } catch {}
+}
+
 /** Capture the extension UI context (called from the session_start handler). */
 export function setQoderUI(ui: unknown): void {
   statusUI = ui && typeof ui === "object" ? (ui as QoderStatusUI) : undefined;
   // A new interactive session rebuilds its widget container (and disposes our
   // component); drop the mount so the next report re-creates the widget there.
-  widgetMounted = false;
-  widgetTui = undefined;
-  widgetTheme = undefined;
-  widgetGeneration++;
+  unmountQueueWidget();
 }
 
 /** Plain-text truncation for one terminal row. The status line is ASCII/· only. */
@@ -139,17 +220,44 @@ function mountQueueWidget(): void {
   }
 }
 
+/** Stand our fallback row down (used when cleared and when a host takes over). */
+function unmountQueueWidget(): void {
+  if (!widgetMounted) return;
+  widgetMounted = false;
+  widgetTui = undefined;
+  widgetTheme = undefined;
+  widgetGeneration++;
+  try {
+    statusUI?.setWidget?.(QUEUE_WIDGET_KEY, undefined);
+  } catch {}
+}
+
 /**
- * Show one queue-status line on the dedicated widget row above the editor.
- * Safe to call every tick: the line mutates in place and pi only re-renders.
+ * Show one queue-status line. Safe to call every tick.
+ *
+ * Sink order: the handshake file always carries the line (a widget host may
+ * render it above "Working for"); our own fallback row only mounts when no
+ * host claimed the job within the grace period.
  */
 export function reportQueueStatus(line: string): void {
   statusLine = line;
+  if (episodeStartAt === 0) episodeStartAt = Date.now();
+  publishQueueLine(line);
   if (!statusUI) return;
+  if (consumerActive()) {
+    // A host is rendering the row above "Working for" — never duplicate it.
+    // Deliberately not even the setWorkingMessage fallback: it would poison
+    // pi's workingMessage field, which the host relies on for a seamless
+    // restore of "Working for …" once the queue clears.
+    unmountQueueWidget();
+    return;
+  }
   if (!widgetMounted) {
+    if (Date.now() - episodeStartAt < queueWidgetGraceMs()) return;
     mountQueueWidget();
     if (!widgetMounted && typeof statusUI.setWorkingMessage === "function") {
       // Old pi without widgets: fall back to the working row.
+      usingWorkingMessageFallback = true;
       try {
         statusUI.setWorkingMessage(line);
       } catch {}
@@ -161,19 +269,15 @@ export function reportQueueStatus(line: string): void {
 
 /** Remove the queue-status row once we are no longer waiting. */
 export function clearQueueStatus(): void {
-  if (statusLine === undefined && !widgetMounted) return;
+  episodeStartAt = 0;
+  unpublishQueueLine();
+  if (statusLine === undefined && !widgetMounted && !usingWorkingMessageFallback) return;
   statusLine = undefined;
-  if (widgetMounted) {
-    widgetMounted = false;
-    widgetTui = undefined;
-    widgetTheme = undefined;
-    widgetGeneration++;
+  unmountQueueWidget();
+  if (usingWorkingMessageFallback) {
+    usingWorkingMessageFallback = false;
     try {
-      statusUI?.setWidget?.(QUEUE_WIDGET_KEY, undefined);
-    } catch {}
-  } else if (typeof statusUI?.setWorkingMessage === "function") {
-    try {
-      statusUI.setWorkingMessage(undefined);
+      statusUI?.setWorkingMessage?.(undefined);
     } catch {}
   }
 }
