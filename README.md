@@ -14,6 +14,7 @@
 - **输出上限 128K**：对齐阿里云百炼官方 Max Output Length（131072），思考模式下不截断思维链。
 - **上下文自适应**：从 `context_config` 取最大可选档（如 1M），无配置时回退 200K。
 - **签名与 WAF 绕过**：内置 COSY 签名头生成（RSA/AES-CBC/MD5）与 WAF body 编码（`Encode=1`）。
+- **排队等待与状态行**：上游模型饱和时（10605 通知）自动进入队列：优先轮询 `/queue/status`，slot 空出后才重发整段对话；等待期间在编辑器上方渲染一条专属状态行（`Queued on … · position N · est. wait … · check again in Ns`），每秒更新、单行截断，不占用 pi 的 working row（`Working for …`），也不写 stderr 污染 TUI。
 
 ## 安装
 
@@ -56,6 +57,18 @@ export QODERCN_PERSONAL_ACCESS_TOKEN=pt-...    # 中国站
 ```bash
 pi --provider qoder-cn --model qwen3.8-max
 ```
+
+### 排队状态与日志
+
+- 队列状态显示在编辑器上方的专属 widget 行（与 `Working for …` 各占一行，互不覆盖），排队结束自动移除。
+- 插件日志默认只在 stderr **不是终端**（管道/文件）时输出；终端场景下写 stderr 会破坏 pi 的 TUI（差异渲染的行坐标会被打乱，表现为状态行/输入框上方不断堆积变动文本）。需要临时观察排队日志时：
+
+```bash
+QODER_LOG=1 pi ...          # 强制开启（会弄花 TUI，建议重定向到文件）
+pi ... 2> qoder.log         # 或直接重定向 stderr，天然安全
+```
+
+`QODER_QUEUE_LOG` 是 `QODER_LOG` 的别名。其余可用环境变量见 `src/stream.ts`：`QODER_QUEUE_POLL`、`QODER_MODEL_QUEUE_MAX_WAIT_MS`、`QODER_STREAM_FLUSH_MS`。
 
 ## 支持的模型
 

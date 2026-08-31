@@ -10,7 +10,8 @@ import {
   refreshQoderToken,
   refreshQoderTokenCN,
 } from "./oauth.js";
-import { setQoderUI, streamQoder } from "./stream.js";
+import { streamQoder } from "./stream.js";
+import { qoderLog, setQoderUI } from "./ui.js";
 import { fetchQoderUsage, fetchQoderUsageCN } from "./usage.js";
 
 // pi supports a `fetchUsage` hook on the oauth config at runtime, but it is not
@@ -80,7 +81,9 @@ export default async function (pi: ExtensionAPI) {
       await refreshModelsAtStartup(providerID, mode);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
+      // qoderLog, not console.error: extensions load after pi's TUI starts, so
+      // a raw stderr write here smears the screen (see ui.ts).
+      qoderLog(`Automatic login failed for ${providerID}: ${message}`);
     }
   }
 
@@ -90,7 +93,10 @@ export default async function (pi: ExtensionAPI) {
   // the cache was deleted while the token is still valid.
   pi.on("session_start", async (_event, ctx) => {
     // Capture the extension UI context so the streaming layer can surface
-    // queue/retry status in the interactive working row.
+    // queue/retry status on its own widget row above the editor. Deliberately
+    // NOT setWorkingMessage: pi's working loader ("Working for ...") is owned
+    // by interactive mode and status extensions, and fighting over that slot
+    // makes the row flicker between the two messages every second.
     setQoderUI(ctx.ui);
     for (const [providerID, mode] of [
       ["qoder", getQoderMode()],

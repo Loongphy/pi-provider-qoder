@@ -27,6 +27,7 @@ import { getCachedCredentials } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
+import { clearQueueStatus, qoderLog, reportQueueStatus } from "./ui.js";
 
 interface ToolCallState {
   arguments: string;
@@ -74,24 +75,6 @@ function stableChatRecordID(
   hash.update("\0");
   hash.update(`mt=${maxTokens}`);
   return hash.digest("hex").slice(0, 16);
-}
-
-/**
- * Minimal structural view of the pi extension UI context. We only rely on
- * `setWorkingMessage`, which lets a provider surface transient status text in
- * the interactive working/loading row during streaming. Declared structurally
- * (rather than importing the full ExtensionUIContext) so the stream module does
- * not need a hard dependency on the coding-agent extension types.
- */
-interface QoderWorkingUI {
-  setWorkingMessage?(message?: string): void;
-}
-
-let qoderUI: QoderWorkingUI | undefined;
-
-/** Capture the extension UI context (called from the session_start handler). */
-export function setQoderUI(ui: QoderWorkingUI | undefined): void {
-  qoderUI = ui;
 }
 
 /**
@@ -371,25 +354,22 @@ function formatQoderQueueMessage(
 }
 
 /**
- * Report queue status to the pi interactive working row via setWorkingMessage,
- * and to stderr when `log` is set.
+ * Report queue status to the dedicated widget row above the editor, and to
+ * stderr when logging is enabled.
  *
- * The two sinks are deliberately decoupled: the working row is a status line
- * and is safe to rewrite every second, while stderr is a log and is not.
+ * The two sinks are deliberately decoupled: the widget is a status line and is
+ * safe to rewrite every second, while stderr is a log that is throttled and,
+ * critically, must never be attached to pi's TUI (see ui.ts for why any
+ * console.error during streaming smears the whole screen).
  */
 function reportQoderQueueStatus(message: string, opts: { log: boolean }): void {
-  if (opts.log) console.error(`[pi-provider-qoder] ${message}`);
-  try {
-    // The pi working row prefixes its own spinner; the message is plain text.
-    qoderUI?.setWorkingMessage?.(message);
-  } catch {}
+  if (opts.log) qoderLog(message);
+  reportQueueStatus(message);
 }
 
-/** Restore the default working message once we are no longer queued. */
+/** Remove the queue-status row once we are no longer queued. */
 function clearQoderQueueStatus(): void {
-  try {
-    qoderUI?.setWorkingMessage?.(undefined);
-  } catch {}
+  clearQueueStatus();
 }
 
 /**
@@ -867,7 +847,7 @@ export function streamQoder(
             failures++;
             if (failures >= QODER_QUEUE_POLL_MAX_FAILURES) {
               const reason = e instanceof Error ? e.message : String(e);
-              console.error(`[pi-provider-qoder] queue status polling disabled after ${failures} failures: ${reason}`);
+              qoderLog(`queue status polling disabled after ${failures} failures: ${reason}`);
               return { outcome: "stop-polling", info: latest };
             }
           }
@@ -1195,7 +1175,7 @@ export function streamQoder(
               // outer catch and surface as stopReason="error", not be swallowed.
               if (e instanceof SyntaxError) {
                 if (process.env.QODER_DEBUG) {
-                  console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
+                  qoderLog(`skipping malformed SSE line: ${dataStr.slice(0, 200)}`);
                 }
                 continue;
               }

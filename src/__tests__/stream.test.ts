@@ -7,8 +7,70 @@ import type {
   Model,
   ToolCall,
 } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { QODER_QUEUE_POLL_MAX_FAILURES, setQoderUI, streamQoder } from "../stream.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QODER_QUEUE_POLL_MAX_FAILURES, streamQoder } from "../stream.js";
+import { setQoderUI } from "../ui.js";
+
+/** Strip ANSI escape sequences (the fake theme renders plain text, belt and braces). */
+function stripAnsi(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: escape sequences are the point
+  return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/**
+ * A fake extension UI that captures the queue-status widget the way pi's
+ * interactive mode does: the factory is invoked per setWidget call, the widget
+ * is rendered once on mount (renderWidgets), and every requestRender records
+ * what the row would show at `width`.
+ */
+function widgetUI(width = 200) {
+  const rendered: string[] = [];
+  const workingMessages: (string | undefined)[] = [];
+  const placements: (string | undefined)[] = [];
+  let component: { render(w: number): string[]; dispose?(): void } | undefined;
+  let mountCount = 0;
+  const requestRender = () => {
+    if (component) rendered.push(stripAnsi(component.render(width)[0] ?? ""));
+  };
+  const ui = {
+    setWidget(
+      _key: string,
+      factory:
+        | ((
+            tui: { requestRender(force?: boolean): void },
+            theme: { fg(c: string, t: string): string },
+          ) => {
+            render(w: number): string[];
+            dispose?(): void;
+          })
+        | undefined,
+      opts?: { placement?: string },
+    ) {
+      if (!factory) {
+        component = undefined;
+        return;
+      }
+      placements.push(opts?.placement);
+      component = factory({ requestRender }, { fg: (_c, t) => t });
+      mountCount++;
+      requestRender(); // pi re-renders the widget container on mount
+    },
+    setWorkingMessage(message?: string) {
+      workingMessages.push(message);
+    },
+  };
+  return {
+    ui,
+    /** The queue-status row, one entry per tick, in order. */
+    lines: () => rendered,
+    workingMessages: () => workingMessages,
+    placements: () => placements,
+    isVisible: () => component !== undefined,
+    mounts: () => mountCount,
+    /** Simulate a session switch: pi disposes mounted widgets. */
+    dispose: () => component?.dispose?.(),
+  };
+}
 
 /**
  * Build a single SSE `data:` line carrying a Qoder envelope:
@@ -105,12 +167,18 @@ async function consume(stream: AssistantMessageEventStream): Promise<AssistantMe
 
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
+  beforeEach(() => {
+    // Vitest's stderr is a pipe, so qoderLog would default to on here; keep
+    // the suite quiet unless a test opts in explicitly.
+    process.env.QODER_LOG = "0";
+  });
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
     setQoderUI(undefined);
     delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
     delete process.env.QODER_QUEUE_POLL;
+    delete process.env.QODER_LOG;
   });
 
   it("parses a successful SSE stream into text + stop", async () => {
@@ -375,11 +443,6 @@ describe("streamQoder", () => {
     return { body: { data: inner } };
   }
 
-  /** The status strings pushed to setWorkingMessage, in order (clears are undefined). */
-  function statusLines(spy: ReturnType<typeof vi.fn>): string[] {
-    return spy.mock.calls.map((c) => c[0]).filter((m): m is string => typeof m === "string");
-  }
-
   /**
    * Build an SSE envelope carrying Qoder's triple-nested "queued" 403 notice:
    *   body = {"code":"403","message":"{\"code\":\"10605\",\"message\":\"<inner>\"}"}
@@ -480,8 +543,9 @@ describe("streamQoder", () => {
     // and then left alone, so "retry in 30s" sat unchanged for 30 seconds and
     // read as a hang.
     process.env.QODER_QUEUE_POLL = "0";
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    process.env.QODER_LOG = "1";
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const route = mockFetchQueue({
       chat: [
@@ -492,31 +556,107 @@ describe("streamQoder", () => {
     globalThis.fetch = route.fetch;
     await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const lines = statusLines(setWorkingMessage);
+    const lines = widget.lines();
     expect(lines.some((m) => m.includes("retry in 2s"))).toBe(true);
     expect(lines.some((m) => m.includes("retry in 1s"))).toBe(true);
     expect(lines.some((m) => m.includes("retry in 0s"))).toBe(true);
     // The elapsed side of the budget moves with it.
     expect(lines.some((m) => m.includes("waited 0s/"))).toBe(true);
     expect(lines.some((m) => m.includes("waited 2s/"))).toBe(true);
-    // The working row is a status line and ticks; stderr is a log and does not,
+    // The widget row is a status line and ticks; stderr is a log and does not,
     // so a long wait cannot turn into a per-second log flood.
     const logged = errorSpy.mock.calls.filter((c) => String(c[0]).includes("pi-provider-qoder"));
     expect(logged.length).toBeLessThan(lines.length);
   }, 20_000);
 
-  it("reports queue status via setWorkingMessage and clears it on success", async () => {
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+  it("reports queue status on its own widget row above the editor, never on the working row", async () => {
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     await consume(stream);
 
-    const messages = setWorkingMessage.mock.calls.map((c) => c[0]);
-    expect(messages.some((m) => typeof m === "string" && m.includes("Queued on qmodel_preview"))).toBe(true);
-    expect(messages.some((m) => typeof m === "string" && m.includes("position 489"))).toBe(true);
-    // The final call restores the default working message (undefined).
-    expect(messages[messages.length - 1]).toBeUndefined();
+    const lines = widget.lines();
+    expect(lines.some((m) => m.includes("Queued on qmodel_preview"))).toBe(true);
+    expect(lines.some((m) => m.includes("position 489"))).toBe(true);
+    // The row lives in the extension-widget area above the editor (pi has no
+    // slot above the working row), so "Working for ..." keeps its own line.
+    expect(widget.placements().every((p) => p === "aboveEditor")).toBe(true);
+    expect(widget.workingMessages()).toEqual([]);
+    // Cleared once real content starts streaming, and the row is removed.
+    expect(widget.isVisible()).toBe(false);
+  });
+
+  it("keeps the queue row to one truncated line regardless of terminal width", async () => {
+    const narrow = widgetUI(40);
+    setQoderUI(narrow.ui);
+    globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    // A wrapped status row is what made the layout jump; the widget must stay
+    // exactly one line tall at any width.
+    for (const line of narrow.lines()) expect(line.length).toBeLessThanOrEqual(40);
+    expect(narrow.lines().some((m) => m.includes("Queued on qmodel_preview"))).toBe(true);
+  });
+
+  it("mounts the widget once per queue episode and updates it in place", async () => {
+    // Several looks at the queue and several ticks of the countdown must not
+    // rebuild the widget container each time; only the line content changes.
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
+    const route = mockFetchQueue({
+      chat: [QUEUED_SSE, SUCCESS_SSE],
+      poll: [
+        queueStatus({ isQueued: true, queueCount: 412, retryAfterSeconds: 0 }),
+        queueStatus({ isQueued: false, retryAfterSeconds: 0 }),
+      ],
+    });
+    globalThis.fetch = route.fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(widget.mounts()).toBe(1);
+    expect(widget.lines().length).toBeGreaterThan(1);
+    expect(widget.isVisible()).toBe(false);
+  }, 30_000);
+
+  it("re-mounts the widget after a session switch disposed it", async () => {
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
+    globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(widget.isVisible()).toBe(false);
+
+    // A second queued request in a new session: pi disposed the old component.
+    widget.dispose();
+    globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(widget.lines().some((m) => m.includes("Queued on qmodel_preview"))).toBe(true);
+    expect(widget.isVisible()).toBe(false);
+  });
+
+  it("writes nothing to stderr while pi's TUI owns the terminal", async () => {
+    // The original bug: console.error during streaming scrolls the terminal
+    // behind pi's renderer's back, which re-paints the working row on a new
+    // line every tick and pushes the composer off screen. stderr attached to a
+    // TTY must therefore stay silent unless logging is explicitly requested.
+    const stderrDesc = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+    Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      delete process.env.QODER_LOG; // the default path: silent on a TTY
+      globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+      await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+      expect(errorSpy.mock.calls.filter((c) => String(c[0]).includes("pi-provider-qoder"))).toEqual([]);
+
+      // Opt-in logging still works.
+      process.env.QODER_LOG = "1";
+      globalThis.fetch = mockFetchSequence([QUEUED_SSE, SUCCESS_SSE]);
+      await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+      expect(errorSpy.mock.calls.some((c) => String(c[0]).includes("[pi-provider-qoder] Queued on"))).toBe(true);
+    } finally {
+      if (stderrDesc) Object.defineProperty(process.stderr, "isTTY", stderrDesc);
+      else delete (process.stderr as { isTTY?: boolean }).isTTY;
+    }
   });
 
   it("still errors on a non-queue 403 (no retry)", async () => {
@@ -568,8 +708,8 @@ describe("streamQoder", () => {
   it("waits out a long queue by polling, re-uploading the conversation only once", async () => {
     // The case the poll route exists for: several looks at the queue, and the
     // multi-megabyte body goes out exactly twice (original + the real send).
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     const route = mockFetchQueue({
       chat: [QUEUED_SSE, SUCCESS_SSE],
       poll: [
@@ -588,15 +728,15 @@ describe("streamQoder", () => {
     // The position is re-read on every look, so it walks down instead of being
     // frozen at whatever the first notice said. NOTE: the stale "position 489"
     // from QUEUED_SSE is never shown once a poll answers.
-    const lines = statusLines(setWorkingMessage);
+    const lines = widget.lines();
     expect(lines.some((m) => m.includes("position 900"))).toBe(true);
     expect(lines.some((m) => m.includes("position 412"))).toBe(true);
     expect(lines.some((m) => m.includes("position 7"))).toBe(true);
   }, 30_000);
 
   it("keeps polling while serviceAvailable is false and only resends on a free slot", async () => {
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     const route = mockFetchQueue({
       chat: [QUEUED_SSE, SUCCESS_SSE],
       poll: [
@@ -611,7 +751,7 @@ describe("streamQoder", () => {
     expect(route.gets()).toBe(2);
     expect(route.posts()).toBe(2);
     // A free slot is announced as a resend, not as another wait.
-    expect(statusLines(setWorkingMessage).some((m) => m.includes("slot free \u00B7 resending"))).toBe(true);
+    expect(widget.lines().some((m) => m.includes("slot free \u00B7 resending"))).toBe(true);
   }, 30_000);
 
   it("asks the queue endpoint with requestSetId, modelKey and queueType", async () => {
@@ -670,8 +810,8 @@ describe("streamQoder", () => {
   }, 20_000);
 
   it("honors the advertised retryAfterSeconds and labels a refused slot as busy", async () => {
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     const route = mockFetchQueue({
       chat: [queueEnvelope(REFUSED_QUEUE_NOTICE), SUCCESS_SSE],
       // The service is down on the first look, so the same 2s hint is slept as a
@@ -682,7 +822,7 @@ describe("streamQoder", () => {
     globalThis.fetch = route.fetch;
     await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const lines = statusLines(setWorkingMessage);
+    const lines = widget.lines();
     expect(lines[0]).toContain("Busy on qfmodel");
     // The hint is taken literally in both phases, not clamped to something
     // shorter.
@@ -694,12 +834,12 @@ describe("streamQoder", () => {
   }, 20_000);
 
   it("waits 1s when the notice carries no retryAfterSeconds", async () => {
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     globalThis.fetch = mockFetchSequence([queueEnvelope({ isQueued: false, modelKey: "qfmodel" }), SUCCESS_SSE]);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const lines = statusLines(setWorkingMessage);
+    const lines = widget.lines();
     // The first line is the notice itself (the 30s poll default); the 1s
     // fallback applies to the wait before the re-send.
     expect(lines[0]).toContain("check again in 30s");
@@ -714,8 +854,8 @@ describe("streamQoder", () => {
     // A 120s hint must be taken literally: qodercli's 30s poll throttle is not
     // our semantics, and cutting it early would re-POST the whole conversation
     // 90s too soon. Abort mid-wait so the test does not sleep 2 minutes.
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 300);
     globalThis.fetch = mockFetchSequence([
@@ -726,7 +866,7 @@ describe("streamQoder", () => {
       streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
     );
 
-    const lines = statusLines(setWorkingMessage);
+    const lines = widget.lines();
     expect(lines.some((m) => m.includes("in 120s"))).toBe(true);
     const err = events.find((e) => e.type === "error") as { error: AssistantMessage } | undefined;
     expect(err?.error.stopReason, "the wait must stay interruptible").toBe("aborted");
@@ -752,18 +892,17 @@ describe("streamQoder", () => {
     expect(route.posts()).toBe(2);
   }, 20_000);
 
-  it("clears the working message when the retry budget is exhausted", async () => {
+  it("clears the queue row when the retry budget is exhausted", async () => {
     process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS = "1200";
-    const setWorkingMessage = vi.fn();
-    setQoderUI({ setWorkingMessage });
+    const widget = widgetUI();
+    setQoderUI(widget.ui);
     globalThis.fetch = mockFetchSequence([
       queueEnvelope({ isQueued: false, modelKey: "qfmodel", retryAfterSeconds: 0 }),
     ]);
     await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
 
-    const calls = setWorkingMessage.mock.calls.map((c) => c[0]);
-    expect(calls.some((m) => typeof m === "string")).toBe(true);
-    expect(calls[calls.length - 1]).toBeUndefined();
+    expect(widget.lines().some((m) => m.length > 0)).toBe(true);
+    expect(widget.isVisible()).toBe(false);
   }, 20_000);
 
   it("retries when the notice arrives as a real HTTP 403 instead of an SSE envelope", async () => {
