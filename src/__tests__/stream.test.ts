@@ -1,16 +1,17 @@
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
-  Context,
   Model,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { QODER_QUEUE_POLL_MAX_FAILURES, streamQoder } from "../stream.js";
 import { setQoderUI } from "../ui.js";
 
@@ -151,12 +152,12 @@ function makeModel(): Model<Api> {
   return { id: "ultimate", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
 }
 
-function makeContext(): Context {
-  return {
+function makeContext(): TranscriptContext {
+  return normalizeContext({
     systemPrompt: "test",
-    messages: [{ role: "user", content: "hi" }],
+    messages: [{ role: "user", content: "hi", timestamp: 0 }],
     tools: [],
-  } as unknown as Context;
+  });
 }
 
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
@@ -1055,6 +1056,156 @@ describe("streamQoder", () => {
     expect(bodies.length).toBe(2);
     expect(bodies[1].equals(bodies[0])).toBe(true);
     expect(auths[1]).not.toBe(auths[0]);
+  }, 20_000);
+});
+
+describe("request identity: one billed task per user prompt", () => {
+  const originalFetch = globalThis.fetch;
+  let stateDir = "";
+
+  /** A 10605 queued notice, so the provider also exercises the queue path. */
+  function queuedNotice(inner: object): string {
+    const mid = { code: "10605", message: JSON.stringify(inner) };
+    const outer = { code: "403", message: JSON.stringify(mid) };
+    return sseEnvelope(outer, 403, "Forbidden");
+  }
+  const QUEUED_NOTICE_SSE = queuedNotice({
+    isQueued: true,
+    modelKey: "qmodel_preview",
+    queueCount: 489,
+    queueType: "slow",
+    retryAfterSeconds: 0,
+    serviceAvailable: true,
+  });
+
+  beforeEach(() => {
+    process.env.QODER_LOG = "0";
+    stateDir = mkdtempSync(join(tmpdir(), "qoder-ui-test-"));
+    process.env.PI_AGENT_DIR = stateDir;
+    process.env.QODER_QUEUE_YIELD_GRACE_MS = "0";
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    setQoderUI(undefined);
+    delete process.env.QODER_MODEL_QUEUE_MAX_WAIT_MS;
+    delete process.env.QODER_QUEUE_POLL;
+    delete process.env.QODER_LOG;
+    delete process.env.PI_AGENT_DIR;
+    delete process.env.QODER_QUEUE_YIELD_GRACE_MS;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  /**
+   * Undo the WAF body obfuscation so a test can read the request JSON.
+   * Inverse of qoderEncodeBody: swap the custom alphabet back, un-rotate the
+   * three segments, then base64-decode.
+   */
+  function decodeQoderBody(body: unknown): Record<string, any> {
+    const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    const std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const swapped = String(body)
+      .split("")
+      .map((ch) => {
+        const i = custom.indexOf(ch);
+        if (i >= 0) return std[i];
+        return ch === "$" ? "=" : ch;
+      })
+      .join("");
+    const n = swapped.length;
+    const a = Math.floor(n / 3);
+    const b64 = swapped.slice(n - a) + swapped.slice(a, n - a) + swapped.slice(0, a);
+    return JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as Record<string, any>;
+  }
+
+  it("keeps request_set_id and business.id stable across a task's tool round-trips", async () => {
+    // qodercli mints both once per AgentLifecycle and reuses them for every
+    // request of the run; that grouping is what makes the gateway accumulate
+    // the round-trips into one billed task instead of charging each one.
+    const bodies: Array<Record<string, any>> = [];
+    globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      bodies.push(decodeQoderBody(init?.body));
+      return new Response(SUCCESS_SSE, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const base = makeContext();
+    // Turn 1: user prompt -> assistant -> tool result -> next request.
+    await consume(streamQoder(makeModel(), base, { apiKey: "fake", sessionId: "sess-1" }));
+    const afterPrompt = {
+      ...base,
+      messages: [
+        ...base.messages,
+        { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: "{}" }] },
+        {
+          role: "toolResult",
+          toolCallId: "c1",
+          toolName: "bash",
+          content: [{ type: "text", text: "ok" }],
+          isError: false,
+        },
+      ],
+    } as TranscriptContext;
+    await consume(streamQoder(makeModel(), afterPrompt, { apiKey: "fake", sessionId: "sess-1" }));
+
+    expect(bodies.length).toBe(2);
+    expect(bodies[0].request_set_id).toBe(bodies[1].request_set_id);
+    expect(bodies[0].business.id).toBe(bodies[1].business.id);
+    expect(bodies[0].business.id).toBe(bodies[0].request_set_id);
+    expect(bodies[0].business.begin_at).toBe(bodies[1].business.begin_at);
+    // Per-request identity still differs, as in qodercli (request_id is minted
+    // per request; chat_record_id stays content-addressed so a queue resend
+    // replays identical bytes).
+    expect(bodies[0].request_id).not.toBe(bodies[1].request_id);
+    expect(bodies[0].chat_record_id).not.toBe(bodies[1].chat_record_id);
+    expect(bodies[0].session_id).toBe(bodies[1].session_id);
+  });
+
+  it("starts a new task when the user sends a new prompt", async () => {
+    const bodies: Array<Record<string, any>> = [];
+    globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      bodies.push(decodeQoderBody(init?.body));
+      return new Response(SUCCESS_SSE, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const first = makeContext();
+    await consume(streamQoder(makeModel(), first, { apiKey: "fake", sessionId: "sess-1" }));
+    const second = {
+      ...first,
+      messages: [
+        ...first.messages,
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+        { role: "user", content: "and another thing" },
+      ],
+    } as TranscriptContext;
+    await consume(streamQoder(makeModel(), second, { apiKey: "fake", sessionId: "sess-1" }));
+
+    expect(bodies.length).toBe(2);
+    expect(bodies[1].request_set_id).not.toBe(bodies[0].request_set_id);
+    expect(bodies[1].business.id).toBe(bodies[1].request_set_id);
+  });
+
+  it("polls the queue endpoint with the task id it sends as request_set_id", async () => {
+    const bodies: Array<Record<string, any>> = [];
+    const getUrls: string[] = [];
+    let chatCall = 0;
+    globalThis.fetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const target = String(url);
+      if (target.includes("/queue/status")) {
+        getUrls.push(target);
+        return new Response(JSON.stringify({ data: { isQueued: false, retryAfterSeconds: 0 } }), { status: 200 });
+      }
+      bodies.push(decodeQoderBody(init?.body));
+      return new Response(chatCall++ === 0 ? QUEUED_NOTICE_SSE : SUCCESS_SSE, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", sessionId: "sess-1" }));
+
+    expect(getUrls.length).toBeGreaterThan(0);
+    expect(bodies.length).toBeGreaterThan(0);
+    const url = new URL(getUrls[0]);
+    // The queue entry is keyed by request set, so the poll must carry the same
+    // task id the body advertises (verified against qodercli's okc()).
+    expect(url.searchParams.get("requestSetId")).toBe(bodies[0].request_set_id);
   }, 20_000);
 });
 

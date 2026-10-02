@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { getMachineId, getQoderMode, getQoderRefreshURL, isQoderCNMode } from "./cosy.js";
 import { interactiveLogin } from "./login.js";
 import { updateQoderModelsCache } from "./models.js";
@@ -55,16 +54,7 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: st
   // account's credentials.
   const credentials = await credentialsFromPat(pat, mode);
 
-  if (typeof AuthStorage !== "undefined" && typeof AuthStorage?.create === "function") {
-    try {
-      const authStorage = AuthStorage.create();
-      authStorage.set(providerID, { type: "oauth", ...credentials });
-    } catch {
-      saveCredentialsToAuthFile(providerID, credentials);
-    }
-  } else {
-    saveCredentialsToAuthFile(providerID, credentials);
-  }
+  saveCredentialsToAuthFile(providerID, credentials);
 
   const qCreds = credentials as QoderCredentials;
   // Wait for the model cache before the provider is registered. This matters

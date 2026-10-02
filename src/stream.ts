@@ -5,13 +5,15 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
-  type Context,
   clampThinkingLevel,
+  getCurrentSystemPrompt,
+  getCurrentTools,
   type Model,
   type SimpleStreamOptions,
   type TextContent,
   type ThinkingContent,
   type ToolCall,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
   buildAuthHeaders,
@@ -46,6 +48,77 @@ function stableHash(prefix: string, ...inputs: string[]): string {
     hash.update(input);
   }
   return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * Identity of the current TASK: one user prompt plus every model request its
+ * tool loop makes.
+ *
+ * Confirmed against @qoder-ai/qodercli 1.1.38: the agent loop passes the SAME
+ * `requestSetId` and the same `business` object (id/begin_at/stage) into every
+ * request it builds (`lHc` -> `mFA`), both minted once per AgentLifecycle.
+ * That is what lets the gateway accumulate the tool-call round-trips of a task
+ * into ONE billed unit instead of charging each request separately.
+ *
+ * A provider gets no lifecycle events, so the run is derived from the
+ * conversation: the newest `user` turn. It stays put while tool results are
+ * appended (they arrive as `toolResult` messages in pi) and changes the moment
+ * the user sends a new prompt. The turn's index is folded in so a repeated
+ * prompt, or a conversation rewritten by compaction, starts a new task.
+ */
+function qoderTaskID(sessionID: string, messages: Array<{ role?: string; content?: unknown }>): string {
+  let index = -1;
+  let text = "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "user") continue;
+    index = i;
+    text = userTextOf(message.content);
+    break;
+  }
+  return stableHash("qoder-task", sessionID, String(index), text);
+}
+
+/** Plain text of a pi message content payload (string or text blocks). */
+function userTextOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && (part as { type?: string }).type === "text") {
+          const text = (part as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
+        }
+        return "";
+      })
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * `business.begin_at` per task: the whole run reports the timestamp its first
+ * request was built at, not one per round-trip.
+ */
+const QODER_TASK_START_CACHE_MAX = 64;
+const qoderTaskStarts = new Map<string, number>();
+
+function qoderTaskStartMs(taskID: string): number {
+  const existing = qoderTaskStarts.get(taskID);
+  if (existing !== undefined) {
+    // Refresh LRU position so long-running tasks are not evicted.
+    qoderTaskStarts.delete(taskID);
+    qoderTaskStarts.set(taskID, existing);
+    return existing;
+  }
+  const now = Date.now();
+  qoderTaskStarts.set(taskID, now);
+  if (qoderTaskStarts.size > QODER_TASK_START_CACHE_MAX) {
+    const oldest = qoderTaskStarts.keys().next().value;
+    if (oldest !== undefined) qoderTaskStarts.delete(oldest);
+  }
+  return now;
 }
 
 function stableChatRecordID(
@@ -448,7 +521,7 @@ function qoderStreamFlushMs(): number {
 
 export function streamQoder(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
@@ -514,7 +587,10 @@ export function streamQoder(
       const isReasoning = !!modelConfig.is_reasoning;
 
       const normalizedMessages = transformMessagesForQoder(context.messages);
-      const systemText = context.systemPrompt || "";
+      // TranscriptContext: the prompt lives in the transcript's system
+      // messages; transformMessagesForQoder drops them, so it is re-attached
+      // below as the leading role:system entry.
+      const systemText = getCurrentSystemPrompt(context.messages);
 
       let lastUserText = "";
       for (let i = normalizedMessages.length - 1; i >= 0; i--) {
@@ -548,8 +624,14 @@ export function streamQoder(
         maxTokens = options.maxTokens;
       }
 
-      const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
+      const currentToolDefs = getCurrentTools(context.messages);
+      const toolsRaw = currentToolDefs.length > 0 ? transformTools(currentToolDefs) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+
+      // Task-scoped identity: shared by every request of this run the way
+      // qodercli shares its AgentLifecycle ids, so the gateway accumulates the
+      // tool-call round-trips into one billed task (see qoderTaskID).
+      const taskID = qoderTaskID(sessionID, context.messages);
 
       // Map pi's thinking level (options.reasoning) to Qoder's request fields.
       // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
@@ -585,7 +667,10 @@ export function streamQoder(
 
       const reqBody: Record<string, unknown> = {
         request_id: crypto.randomUUID(),
-        request_set_id: recordID,
+        // Task-scoped (qodercli: requestSetId, one per AgentLifecycle). A
+        // per-request value here is what made every tool round-trip look like
+        // a task of its own to the gateway.
+        request_set_id: taskID,
         chat_record_id: recordID,
         session_id: sessionID,
         stream: true,
@@ -628,9 +713,11 @@ export function streamQoder(
           version: "1.0.0",
           type: "agent",
           stage: "start",
-          id: crypto.randomUUID(),
+          // Same id as request_set_id, as in qodercli's lifecycle (business.id
+          // and requestSetId are minted together per run).
+          id: taskID,
           name: lastUserText.substring(0, 30),
-          begin_at: Date.now(),
+          begin_at: qoderTaskStartMs(taskID),
         },
       };
 
@@ -768,7 +855,9 @@ export function streamQoder(
        */
       const fetchQueueStatus = async (info: QoderQueueInfo): Promise<QoderQueueInfo | null> => {
         const url = getQoderQueueStatusURL(providerMode, {
-          requestSetID: recordID,
+          // The queue entry is keyed by request set, i.e. by the TASK, the same
+          // id qodercli polls with (okc() in its bundle takes requestSetId).
+          requestSetID: taskID,
           modelKey: info.modelKey || qoderModel,
           queueType: info.queueType,
         });

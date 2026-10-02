@@ -9,13 +9,14 @@
  * loopback HTTP with the stock fetch.
  */
 import http from "node:http";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
-  Context,
   Model,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { streamQoder } from "../stream.js";
@@ -64,8 +65,8 @@ function makeModel(): Model<Api> {
   return { id: "ultimate", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
 }
 
-function makeContext(): Context {
-  return { systemPrompt: "test", messages: [{ role: "user", content: "hi" }], tools: [] } as unknown as Context;
+function makeContext(): TranscriptContext {
+  return normalizeContext({ systemPrompt: "test", messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] });
 }
 
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
