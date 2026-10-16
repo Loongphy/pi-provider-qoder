@@ -78,7 +78,13 @@ export default async function (pi: ExtensionAPI) {
   ] as const) {
     try {
       await autoLoginQoderFromEnvironment(providerID, mode);
-      await refreshModelsAtStartup(providerID, mode);
+      // Fire-and-forget: registering the provider below uses the cached model
+      // list anyway, so awaiting the network refresh only delayed pi's startup.
+      // The next session picks up the refreshed cache.
+      void refreshModelsAtStartup(providerID, mode).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        qoderLog(`Model refresh failed for ${providerID}: ${message}`);
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // qoderLog, not console.error: extensions load after pi's TUI starts, so
@@ -109,7 +115,9 @@ export default async function (pi: ExtensionAPI) {
         const userID = creds?.userID || "qoder-user";
         const name = creds?.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User");
         const email = creds?.email || getQoderUserEmailFallback(mode);
-        await updateQoderModelsCache(accessToken, userID, name, email, mode);
+        // Fire-and-forget for the same reason as the startup refresh above;
+        // the result only matters for the next session's cache anyway.
+        void updateQoderModelsCache(accessToken, userID, name, email, mode).catch(() => {});
       } catch {
         // Best-effort: fall back to the existing cache / static models.
       }
