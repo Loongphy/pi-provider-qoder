@@ -1,5 +1,6 @@
 import type { Message, Tool } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { createQoderToolCallIdMapper } from "../tool-call-id.js";
 import { getContentText, transformMessagesForQoder, transformTools } from "../transform.js";
 
 // ── getContentText ────────────────────────────────────────────────────────
@@ -177,7 +178,7 @@ describe("transformMessagesForQoder", () => {
     });
   });
 
-  it("handles assistant message with thinking block", () => {
+  it("replays assistant thinking through reasoning_content", () => {
     const msgs = [
       {
         role: "assistant",
@@ -188,8 +189,44 @@ describe("transformMessagesForQoder", () => {
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result[0].content).toContain("<thinking>let me think</thinking>");
-    expect(result[0].content).toContain("answer");
+    expect(result[0].content).toBe("answer");
+    expect(result[0]).toMatchObject({ reasoning_content: "let me think" });
+    expect(JSON.stringify(result)).not.toContain("<thinking>");
+  });
+
+  it("keeps reasoning-only assistant messages non-null", () => {
+    // The gateway drops assistant messages whose content is null, so a turn
+    // that reasoned without replying must still carry a placeholder — otherwise
+    // its reasoning history is lost on the next request.
+    const msgs = [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "I should check the details." }],
+      },
+    ] as unknown as Message[];
+
+    const result = transformMessagesForQoder(msgs);
+    expect(result[0].content).toBe(" ");
+    expect(result[0]).toMatchObject({ reasoning_content: "I should check the details." });
+  });
+
+  it("strips leaked thinking tags out of replayed reasoning_content", () => {
+    // A thinking block can still hold markup the gateway leaked into the
+    // reasoning channel. Replaying it verbatim feeds that markup back as prompt
+    // text on every following turn.
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "<thinking>let me think</thinking>" },
+          { type: "text", text: "answer" },
+        ],
+      },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+    expect(result[0].content).toBe("answer");
+    expect(result[0]).toMatchObject({ reasoning_content: "let me think" });
+    expect(JSON.stringify(result)).not.toContain("<thinking>");
   });
 
   it("handles toolResult messages", () => {
@@ -276,6 +313,84 @@ describe("transformMessagesForQoder", () => {
     expect(result[0].role).toBe("tool");
   });
 
+  it("keeps parallel tool replies contiguous when they carry images", () => {
+    // Regression: emitting the image `user` message right after each tool result
+    // split the run of replies to one assistant `tool_calls` turn, and the
+    // upstream rejected it with 400 "insufficient tool messages following
+    // tool_calls message". The images must trail the whole run instead.
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_a", name: "read", arguments: { path: "a.png" } },
+          { type: "toolCall", id: "call_b", name: "read", arguments: { path: "b.png" } },
+          { type: "toolCall", id: "call_c", name: "read", arguments: { path: "c.png" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "call_a", content: [{ type: "text", text: "a" }] },
+      {
+        role: "toolResult",
+        toolCallId: "call_b",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "BBB", mimeType: "image/png" },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_c",
+        content: [
+          { type: "text", text: "Read image file [image/jpeg]" },
+          { type: "image", data: "CCC", mimeType: "image/jpeg" },
+        ],
+      },
+    ] as unknown as Message[];
+
+    const result = transformMessagesForQoder(msgs);
+
+    // All three tool replies stay adjacent; their images trail as one message.
+    expect(result.map((m) => m.role)).toEqual(["assistant", "tool", "tool", "tool", "user"]);
+    const parts = result[4].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    expect(parts[0]).toEqual({ type: "text", text: "[2 images returned by the previous tool call]" });
+    expect(parts.slice(1).map((p) => p.image_url?.url)).toEqual([
+      "data:image/png;base64,BBB",
+      "data:image/jpeg;base64,CCC",
+    ]);
+  });
+
+  it("attributes each tool run's images to that run", () => {
+    // Guards the run scan's boundary: a second tool round must not inherit the
+    // first round's images, and each `user` message must follow its own run.
+    const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "a1", name: "read", arguments: {} }] },
+      {
+        role: "toolResult",
+        toolCallId: "a1",
+        content: [
+          { type: "text", text: "first" },
+          { type: "image", data: "ONE", mimeType: "image/png" },
+        ],
+      },
+      { role: "assistant", content: [{ type: "toolCall", id: "b1", name: "read", arguments: {} }] },
+      {
+        role: "toolResult",
+        toolCallId: "b1",
+        content: [
+          { type: "text", text: "second" },
+          { type: "image", data: "TWO", mimeType: "image/png" },
+        ],
+      },
+    ] as unknown as Message[];
+
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => m.role)).toEqual(["assistant", "tool", "user", "assistant", "tool", "user"]);
+    const first = result[2].content as Array<{ image_url?: { url: string } }>;
+    const second = result[5].content as Array<{ image_url?: { url: string } }>;
+    expect(first[1].image_url?.url).toBe("data:image/png;base64,ONE");
+    expect(second[1].image_url?.url).toBe("data:image/png;base64,TWO");
+  });
+
   it("handles assistant message with string content", () => {
     const msgs = [
       {
@@ -347,5 +462,265 @@ describe("transformMessagesForQoder", () => {
     // Tool result must reference the assistant's tool_call id.
     expect(tool.role).toBe("tool");
     expect(tool.tool_call_id).toBe("call_abc123");
+  });
+});
+
+// ── tool call ID rewriting ────────────────────────────────────────────────
+
+describe("createQoderToolCallIdMapper", () => {
+  const WIRE_ID = /^[a-zA-Z0-9_-]{1,64}$/;
+
+  it("passes through IDs that are already wire-valid", () => {
+    const map = createQoderToolCallIdMapper();
+    for (const id of ["call_abc123", "fc_1", "a", "-_AZaz09", "x".repeat(64)]) {
+      expect(map(id)).toBe(id);
+    }
+  });
+
+  it("rewrites IDs containing '|' to a 64-char qtc_ hex ID", () => {
+    const map = createQoderToolCallIdMapper();
+    const wire = map("call_1|fc_1");
+    expect(wire).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(wire).toMatch(WIRE_ID);
+    expect(wire).toHaveLength(64);
+  });
+
+  it("pins the digest scheme to a known vector", () => {
+    // sha256("qoder-tool-call-id:v1\0" + original)[0:60] — changing the domain
+    // separator, hash, or truncation changes every wire ID in existing sessions,
+    // so the exact value is pinned here.
+    const map = createQoderToolCallIdMapper();
+    expect(map("call_fixture|fc_fixture")).toBe("qtc_ae79c0553526986e103018301821c6e48a4181aa373a996474e105442b1a");
+  });
+
+  it("hashes the complete ID, so a shared call_id prefix does not collide", () => {
+    const map = createQoderToolCallIdMapper();
+    expect(map("call_A|fc_A")).not.toBe(map("call_A|fc_B"));
+  });
+
+  it("rewrites overlong IDs even when their charset is valid", () => {
+    const map = createQoderToolCallIdMapper();
+    const wire = map(`call_${"x".repeat(100)}`);
+    expect(wire).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(wire).toMatch(WIRE_ID);
+  });
+
+  it("re-hashes an input that already looks like a generated ID", () => {
+    // The qtc_ + 60 hex namespace is reserved for generated values; letting such
+    // an input pass through could collide with another ID's digest.
+    const map = createQoderToolCallIdMapper();
+    const spoof = `qtc_${"0".repeat(60)}`;
+    const wire = map(spoof);
+    expect(wire).not.toBe(spoof);
+    expect(wire).toMatch(/^qtc_[0-9a-f]{60}$/);
+  });
+
+  it("is deterministic across mapper instances (cross-request stability)", () => {
+    // Session history keeps raw IDs; a later request re-transforms them, and the
+    // wire ID must be the one already sent or the tool pairing breaks.
+    const original = "call_1|fc_1";
+    expect(createQoderToolCallIdMapper()(original)).toBe(createQoderToolCallIdMapper()(original));
+  });
+
+  it("produces wire-valid output for arbitrary nasty inputs", () => {
+    const map = createQoderToolCallIdMapper();
+    for (const id of ["a|b|c", "has space", "uni✓code", "qtc_", "qtc_nothex", "|", "a".repeat(500)]) {
+      expect(map(id)).toMatch(WIRE_ID);
+    }
+  });
+
+  it("synthesizes a stable ID for an empty or non-string ID instead of throwing", () => {
+    // Our stream opens a tool-call block on `id || name`, so a name-only call
+    // reaches history with an empty ID. Throwing would fail every later request
+    // in the session, which is the failure this mapper exists to prevent.
+    const map = createQoderToolCallIdMapper();
+    const empty = map("");
+    expect(empty).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(map("")).toBe(empty);
+    expect(createQoderToolCallIdMapper()("")).toBe(empty);
+    expect(map(undefined as unknown as string)).toBe(empty);
+    expect(map(null as unknown as string)).toBe(empty);
+  });
+
+  it("throws on a wire-ID collision instead of remapping silently", () => {
+    const constantDigest = () => `qtc_${"f".repeat(60)}`;
+    const map = createQoderToolCallIdMapper(constantDigest);
+    map("call_A|fc_A");
+    expect(() => map("call_B|fc_B")).toThrow("collision");
+  });
+
+  it("treats a pass-through ID as occupying its wire value", () => {
+    const map = createQoderToolCallIdMapper(() => "plain_id");
+    map("plain_id");
+    expect(() => map("call_A|fc_A")).toThrow("collision");
+  });
+});
+
+describe("transformMessagesForQoder tool call ID rewriting", () => {
+  it("rewrites pi Responses-adapter IDs and keeps the tool result paired", () => {
+    // Regression: pi's OpenAI Responses adapter builds internal tool call IDs
+    // like `call_id|item_id`. Forwarded verbatim, Qoder rejects the request with
+    // 400 "tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$'" and
+    // every later request in the session fails the same way.
+    const msgs = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_abc|fc_xyz", name: "bash", arguments: { command: "ls" } }],
+      },
+      { role: "toolResult", toolCallId: "call_abc|fc_xyz", content: "file1\nfile2" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    const asst = result[1] as { tool_calls?: Array<{ id: string }> };
+    const tool = result[2] as { role: string; tool_call_id: string };
+    const wireId = asst.tool_calls?.[0].id as string;
+    expect(wireId).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(tool.tool_call_id).toBe(wireId);
+    expect(JSON.stringify(result)).not.toContain("call_abc|fc_xyz");
+  });
+
+  it("leaves already-valid IDs untouched", () => {
+    const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_abc123", name: "bash", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call_abc123", content: "ok" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+    expect((result[0] as { tool_calls?: Array<{ id: string }> }).tool_calls?.[0].id).toBe("call_abc123");
+    expect((result[1] as { tool_call_id: string }).tool_call_id).toBe("call_abc123");
+  });
+
+  it("maps distinct IDs that share a call_id prefix to distinct wire IDs", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_A|fc_A", name: "read", arguments: {} },
+          { type: "toolCall", id: "call_A|fc_B", name: "read", arguments: {} },
+        ],
+      },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+    const ids = (result[0] as { tool_calls?: Array<{ id: string }> }).tool_calls?.map((t) => t.id);
+    expect(ids?.[0]).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(ids?.[1]).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(ids?.[0]).not.toBe(ids?.[1]);
+  });
+
+  it("produces the same wire IDs when the same history is transformed again", () => {
+    // Session history keeps raw internal IDs; the next request re-transforms
+    // them, and the wire IDs must match what was already sent or the upstream
+    // sees an unpaired tool result.
+    const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1|fc_1", name: "bash", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call_1|fc_1", content: "ok" },
+    ] as unknown as Message[];
+    expect(transformMessagesForQoder(msgs)).toEqual(transformMessagesForQoder(msgs));
+  });
+
+  it("rewrites an empty tool-call ID instead of sending it to the mapper", () => {
+    // A name-only call our stream recorded with an empty ID must not throw: one
+    // bad request would otherwise fail every later request in the session.
+    const msgs = [
+      { role: "assistant", content: [{ type: "toolCall", id: "", name: "bash", arguments: {} }] },
+      { role: "toolResult", toolCallId: "", content: "ok" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    const asst = result[0] as { tool_calls?: Array<{ id: string }> };
+    const tool = result[1] as { tool_call_id: string };
+    expect(asst.tool_calls?.[0].id).toMatch(/^qtc_[0-9a-f]{60}$/);
+    expect(tool.tool_call_id).toBe(asst.tool_calls?.[0].id);
+  });
+});
+
+// ── orphaned tool results ─────────────────────────────────────────────────
+
+describe("transformMessagesForQoder orphaned tool results", () => {
+  it("drops the tool result whose assistant turn was aborted", () => {
+    // Cancelling a turn mid-tool used to drop only the assistant message and
+    // keep its tool result, leaving a `tool` message with no matching
+    // tool_calls. Upstreams reject that with "tool must follow a message with
+    // tool_calls", so every later request in the session failed.
+    const msgs = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "toolCall", id: "call_gone", name: "bash", arguments: {} }],
+      },
+      { role: "toolResult", toolCallId: "call_gone", content: "output" },
+      { role: "user", content: "again" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(result.some((m) => m.role === "tool")).toBe(false);
+  });
+
+  it("keeps a healthy tool round-trip while dropping an aborted one", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        stopReason: "error",
+        content: [{ type: "toolCall", id: "call_bad", name: "x", arguments: {} }],
+      },
+      { role: "toolResult", toolCallId: "call_bad", content: "r1" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_good", name: "y", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call_good", content: "r2" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result).toHaveLength(2);
+    const asst = result[0] as { tool_calls?: Array<{ id: string }> };
+    const tool = result[1] as { role: string; tool_call_id: string };
+    expect(asst.tool_calls?.map((t) => t.id)).toEqual(["call_good"]);
+    expect(tool.tool_call_id).toBe("call_good");
+
+    // Every tool message must have a declaring tool_calls entry.
+    const declared = new Set(result.flatMap((m) => (m.tool_calls ?? []).map((t) => t.id)));
+    for (const m of result) {
+      if (m.role === "tool") expect(declared.has(m.tool_call_id as string)).toBe(true);
+    }
+  });
+
+  it("still drops an aborted turn whose IDs contain '|'", () => {
+    // The drop filter compares raw internal IDs and runs before mapping, so an
+    // aborted assistant turn must take its tool result down with it exactly as
+    // before, without the mapper ever seeing those IDs.
+    const msgs = [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "toolCall", id: "call_gone|fc_gone", name: "bash", arguments: {} }],
+      },
+      { role: "toolResult", toolCallId: "call_gone|fc_gone", content: "output" },
+      { role: "user", content: "again" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => m.role)).toEqual(["user", "user"]);
+  });
+
+  it("drops an aborted name-only call's result without poisoning later ones", () => {
+    // Every name-only call shares the empty ID, so the id set cannot tell an
+    // aborted turn's result from a healthy one's; only the run right after the
+    // skipped turn is dropped.
+    const msgs = [
+      {
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "toolCall", id: "", name: "bash", arguments: {} }],
+      },
+      { role: "toolResult", toolCallId: "", content: "orphan" },
+      { role: "user", content: "again" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_ok", name: "bash", arguments: {} }] },
+      { role: "toolResult", toolCallId: "call_ok", content: "kept" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+    expect((result[2] as { tool_call_id: string }).tool_call_id).toBe("call_ok");
   });
 });

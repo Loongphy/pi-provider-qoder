@@ -1,18 +1,21 @@
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { normalizeContext } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
+  Context,
   Model,
+  Tool,
   ToolCall,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
+import * as PiAi from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { QODER_QUEUE_POLL_MAX_FAILURES, streamQoder } from "../stream.js";
+import { QODER_QUEUE_POLL_MAX_FAILURES, resolveRequestContext, streamQoder } from "../stream.js";
 import { setQoderUI } from "../ui.js";
 
 /** Strip ANSI escape sequences (the fake theme renders plain text, belt and braces). */
@@ -146,6 +149,28 @@ function mockFetch(body: string): typeof fetch {
     headers: { "content-type": "text/event-stream" },
   });
   return vi.fn(async () => response) as unknown as typeof fetch;
+}
+
+/**
+ * Undo the WAF body obfuscation so a test can read the request JSON.
+ * Inverse of qoderEncodeBody: swap the custom alphabet back, un-rotate the
+ * three segments, then base64-decode.
+ */
+function decodeQoderBody(body: unknown): Record<string, any> {
+  const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+  const std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const swapped = String(body)
+    .split("")
+    .map((ch) => {
+      const i = custom.indexOf(ch);
+      if (i >= 0) return std[i];
+      return ch === "$" ? "=" : ch;
+    })
+    .join("");
+  const n = swapped.length;
+  const a = Math.floor(n / 3);
+  const b64 = swapped.slice(n - a) + swapped.slice(a, n - a) + swapped.slice(0, a);
+  return JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as Record<string, any>;
 }
 
 function makeModel(): Model<Api> {
@@ -1096,28 +1121,6 @@ describe("request identity: one billed task per user prompt", () => {
     rmSync(stateDir, { recursive: true, force: true });
   });
 
-  /**
-   * Undo the WAF body obfuscation so a test can read the request JSON.
-   * Inverse of qoderEncodeBody: swap the custom alphabet back, un-rotate the
-   * three segments, then base64-decode.
-   */
-  function decodeQoderBody(body: unknown): Record<string, any> {
-    const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
-    const std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const swapped = String(body)
-      .split("")
-      .map((ch) => {
-        const i = custom.indexOf(ch);
-        if (i >= 0) return std[i];
-        return ch === "$" ? "=" : ch;
-      })
-      .join("");
-    const n = swapped.length;
-    const a = Math.floor(n / 3);
-    const b64 = swapped.slice(n - a) + swapped.slice(a, n - a) + swapped.slice(0, a);
-    return JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as Record<string, any>;
-  }
-
   it("keeps request_set_id and business.id stable across a task's tool round-trips", async () => {
     // qodercli mints both once per AgentLifecycle and reuses them for every
     // request of the run; that grouping is what makes the gateway accumulate
@@ -1292,4 +1295,158 @@ describe("delta coalescing", () => {
     const text = done.message.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text.length : 0).toBe(6000);
   }, 20_000);
+});
+
+/**
+ * pi-ai changed the shape a provider receives, and not every host followed at
+ * the same time: <=0.85 hands over a flat Context, >=0.86 hands over a folded
+ * TranscriptContext, and some hosts (omp) export the transcript toolkit yet
+ * still pass a flat Context. Resolving prompt and tools from the wrong one
+ * silently sends `tools: []` and loses the whole tool-call protocol.
+ */
+describe("provider context contracts", () => {
+  const tool = { name: "bash", description: "run a command", parameters: {} } as unknown as Tool;
+
+  const flatContext = (): Context =>
+    ({
+      systemPrompt: "PROMPT",
+      messages: [{ role: "user", content: "hi", timestamp: 0 }],
+      tools: [tool],
+    }) as unknown as Context;
+
+  it("recovers prompt and tools from a folded >=0.86 transcript", () => {
+    const folded = normalizeContext({
+      systemPrompt: "PROMPT",
+      messages: [{ role: "user", content: "hi", timestamp: 0 }],
+      tools: [tool],
+    });
+    const resolved = resolveRequestContext(PiAi, folded);
+
+    expect(resolved.systemText).toBe("PROMPT");
+    expect(resolved.tools.map((t) => t.name)).toEqual(["bash"]);
+    // The leading system message must be gone: reqBody re-injects the prompt
+    // itself, so leaving it here would send it twice.
+    expect(resolved.messages[0].role).toBe("user");
+  });
+
+  it("keeps the flat fields when the host passes an unfolded Context", () => {
+    const resolved = resolveRequestContext(PiAi, flatContext());
+
+    expect(resolved.systemText).toBe("PROMPT");
+    expect(resolved.tools.map((t) => t.name)).toEqual(["bash"]);
+  });
+
+  it("uses the flat fields on pi-ai <=0.85, which has no transcript toolkit", () => {
+    const resolved = resolveRequestContext({} as never, flatContext());
+
+    expect(resolved.systemText).toBe("PROMPT");
+    expect(resolved.tools).toHaveLength(1);
+  });
+
+  it("falls back rather than half-resolving when one helper is missing", () => {
+    // getCurrentSystemPrompt-style partial support is the dangerous case: with
+    // no getSystemMessageText the prompt text cannot be rebuilt from the
+    // transcript, and context.systemPrompt is undefined under >=0.86.
+    const partial = { ...PiAi } as unknown as Record<string, unknown>;
+    delete partial.getSystemMessageText;
+    const resolved = resolveRequestContext(partial as never, flatContext());
+
+    expect(resolved.systemText).toBe("PROMPT");
+    expect(resolved.tools).toHaveLength(1);
+  });
+
+  it("sends prompt and tools on the wire for a flat-Context host", async () => {
+    process.env.QODER_LOG = "0";
+    const stateDir = mkdtempSync(join(tmpdir(), "qoder-ui-test-"));
+    process.env.PI_AGENT_DIR = stateDir;
+    const originalFetch = globalThis.fetch;
+    try {
+      const bodies: Array<Record<string, any>> = [];
+      globalThis.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        bodies.push(decodeQoderBody(init?.body));
+        return new Response(SUCCESS_SSE, { status: 200 });
+      }) as unknown as typeof fetch;
+
+      await consume(streamQoder(makeModel(), flatContext(), { apiKey: "fake" }));
+
+      // Qoder ignores the top-level `system` field, so the prompt must arrive
+      // as the leading role:system message.
+      expect(bodies[0].messages[0]).toMatchObject({ role: "system", content: "PROMPT" });
+      expect((bodies[0].tools as Array<{ function?: { name?: string } }>).map((t) => t.function?.name)).toEqual([
+        "bash",
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete process.env.QODER_LOG;
+      delete process.env.PI_AGENT_DIR;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Qoder's gateway keeps the HTTP body open after it has said it is done. The
+ * fixtures hand back a complete Response, which closes on its own and hides
+ * that, so these tests hold the stream open on purpose: if the sentinel only
+ * ends the inner line loop, reader.read() blocks until the server gives up and
+ * a fully delivered reply looks like a stuck turn.
+ */
+describe("stream termination at the sentinel", () => {
+  const originalFetch = globalThis.fetch;
+
+  /** A body that delivers `payload` and then never closes, like the gateway. */
+  function hangingBody(payload: string): { response: Response; cancelled: () => boolean } {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const response = new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    return { response, cancelled: () => cancelled };
+  }
+
+  beforeEach(() => {
+    process.env.QODER_LOG = "0";
+    process.env.PI_AGENT_DIR = mkdtempSync(join(tmpdir(), "qoder-ui-test-"));
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    rmSync(process.env.PI_AGENT_DIR ?? "", { recursive: true, force: true });
+    delete process.env.QODER_LOG;
+    delete process.env.PI_AGENT_DIR;
+  });
+
+  async function finishWithoutHanging(
+    payload: string,
+  ): Promise<{ events: AssistantMessageEvent[]; cancelled: () => boolean }> {
+    const hanging = hangingBody(payload);
+    globalThis.fetch = vi.fn(async () => hanging.response) as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    return { events, cancelled: hanging.cancelled };
+  }
+
+  it("finishes on the envelope-wrapped sentinel and releases the connection", async () => {
+    const { events, cancelled } = await finishWithoutHanging(
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) + sseEnvelope(finishChunk("stop")) + DONE_SSE,
+    );
+
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage } | undefined;
+    expect(done?.message.content.find((c) => c.type === "text")).toMatchObject({ text: "OK" });
+    expect(cancelled()).toBe(true);
+  }, 5000);
+
+  it("finishes on a bare `data: [DONE]` line", async () => {
+    const { events, cancelled } = await finishWithoutHanging(
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) + sseEnvelope(finishChunk("stop")) + "data: [DONE]\n\n",
+    );
+
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage } | undefined;
+    expect(done?.message.content.find((c) => c.type === "text")).toMatchObject({ text: "OK" });
+    expect(cancelled()).toBe(true);
+  }, 5000);
 });

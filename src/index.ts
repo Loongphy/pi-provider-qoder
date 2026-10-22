@@ -20,6 +20,31 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
   fetchUsage: (credentials: OAuthCredentials) => Promise<unknown>;
 };
 
+const QODER_API = "qoder-api" as Api;
+
+/**
+ * pi resolves a custom `api` through a process-wide registry, and
+ * `streamSimple()` on the global `pi-ai` entry point needs `qoder-api` to be in
+ * it (otherwise `resolveApiProvider` throws "No API provider registered for
+ * api: qoder-api"). OMP has no such registry — it imported
+ * `@earendil-works/pi-ai/compat` statically here until that broke loading
+ * there — so probe the export at runtime: stock pi gets the global registration,
+ * OMP falls back to the `registerProvider({ streamSimple })` path below.
+ */
+async function registerQoderApi(): Promise<void> {
+  try {
+    const compat = await import("@earendil-works/pi-ai/compat");
+    const register = (compat as Record<string, unknown>).registerApiProvider;
+    if (typeof register !== "function") return;
+    (register as (config: unknown, source: string) => void)(
+      { api: QODER_API, stream: streamQoder, streamSimple: streamQoder },
+      "provider:qoder",
+    );
+  } catch {
+    // Host has no compat registry; registerProvider(streamSimple) is enough.
+  }
+}
+
 function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   const cached = getCachedModels(mode);
   const modelsToUse = cached.length > 0 ? cached : isQoderCNMode(mode) ? staticCnModels : staticModels;
@@ -49,7 +74,7 @@ function registerQoderProvider(pi: ExtensionAPI, providerID: string, mode: strin
   const oauth = createQoderOAuth(providerID, mode);
   pi.registerProvider(providerID, {
     baseUrl: getQoderBaseUrl(mode),
-    api: "qoder-api" as Api,
+    api: QODER_API,
     models: modelsForProvider(mode, providerID) as unknown as ProviderConfig["models"],
     oauth: oauth as ProviderConfig["oauth"],
     streamSimple: streamQoder,
@@ -72,6 +97,8 @@ async function refreshModelsAtStartup(providerID: string, mode: string): Promise
 }
 
 export default async function (pi: ExtensionAPI) {
+  await registerQoderApi();
+
   for (const [providerID, mode] of [
     ["qoder", getQoderMode()],
     ["qoder-cn", "cn"],

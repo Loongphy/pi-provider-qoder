@@ -1,71 +1,74 @@
 import { describe, expect, it } from "vitest";
 import { qoderEncodeBody } from "../qoder-encoding.js";
 
+/** The wire bytes as text, so the assertions below stay readable. */
+function enc(input: string | Buffer): string {
+  return qoderEncodeBody(input).toString("latin1");
+}
+
 describe("qoderEncodeBody", () => {
-  it("encodes a simple string", () => {
+  it("returns the ASCII payload as a Buffer", () => {
     const result = qoderEncodeBody("hello");
-    expect(result).toBeTruthy();
-    expect(typeof result).toBe("string");
+    expect(Buffer.isBuffer(result)).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
     // Should not contain standard base64 padding char '='
-    expect(result).not.toContain("=");
+    expect(enc("hello")).not.toContain("=");
   });
 
   it("encodes a Buffer", () => {
     const buf = Buffer.from("hello world");
-    const result = qoderEncodeBody(buf);
-    expect(result).toBeTruthy();
-    expect(result).not.toContain("=");
+    expect(enc(buf)).not.toContain("=");
   });
 
   it("produces deterministic output", () => {
-    const a = qoderEncodeBody("test input");
-    const b = qoderEncodeBody("test input");
-    expect(a).toBe(b);
+    expect(qoderEncodeBody("test input")).toStrictEqual(qoderEncodeBody("test input"));
   });
 
   it("produces different output for different inputs", () => {
-    const a = qoderEncodeBody("input A");
-    const b = qoderEncodeBody("input B");
-    expect(a).not.toBe(b);
+    expect(enc("input A")).not.toBe(enc("input B"));
   });
 
   it("handles empty string", () => {
-    const result = qoderEncodeBody("");
-    expect(result).toBe("");
+    expect(qoderEncodeBody("")).toStrictEqual(Buffer.alloc(0));
   });
 
   it("handles empty Buffer", () => {
-    const result = qoderEncodeBody(Buffer.alloc(0));
-    expect(result).toBe("");
+    expect(qoderEncodeBody(Buffer.alloc(0))).toStrictEqual(Buffer.alloc(0));
   });
 
   it("replaces '=' padding with '$'", () => {
     // Base64 of "a" is "YQ==" which has padding — our encoding should use $
-    const result = qoderEncodeBody("a");
+    const result = enc("a");
     expect(result).not.toContain("=");
     expect(result).toContain("$");
   });
 
   it("uses custom alphabet (not standard base64)", () => {
-    const result = qoderEncodeBody("The quick brown fox");
-    // Standard base64 would use A-Za-z0-9+/=
-    // Our encoding uses a custom alphabet, so the output should differ
+    // Standard base64 would use A-Za-z0-9+/=; our encoding uses a custom
+    // alphabet, so the output must differ.
     const stdBase64 = Buffer.from("The quick brown fox").toString("base64");
-    expect(result).not.toBe(stdBase64);
+    expect(enc("The quick brown fox")).not.toBe(stdBase64);
   });
 
   it("handles binary content", () => {
     const binary = Buffer.from([0x00, 0xff, 0x80, 0x7f, 0x01]);
-    const result = qoderEncodeBody(binary);
-    expect(result).toBeTruthy();
+    const result = enc(binary);
     expect(result).not.toContain("=");
   });
 
   it("handles JSON content", () => {
     const json = JSON.stringify({ key: "value", num: 42 });
-    const result = qoderEncodeBody(json);
-    expect(result).toBeTruthy();
-    expect(result).not.toContain("=");
+    expect(enc(json)).not.toContain("=");
+  });
+
+  it("is safe to send: pure ASCII, no bytes above 0x7f", () => {
+    // The Buffer is signed and POSTed as-is, so the table must never emit a
+    // non-ASCII byte (which allocUnsafe would happily leave as garbage).
+    for (const input of ["hello", "a", Buffer.from([0x00, 0xff, 0x10]).toString(), JSON.stringify({ a: 1 })]) {
+      for (const byte of qoderEncodeBody(input)) {
+        expect(byte).toBeLessThanOrEqual(0x7f);
+      }
+    }
   });
 });
 
@@ -126,11 +129,11 @@ describe("qoderEncodeBody equivalence with the reference implementation", () => 
     }
 
     for (const c of cases) {
-      expect(qoderEncodeBody(c), `input: ${String(c).slice(0, 24)}`).toBe(referenceEncode(c));
+      expect(enc(c), `input: ${String(c).slice(0, 24)}`).toBe(referenceEncode(c));
     }
   });
 
   it("pins the wire format with a golden vector", () => {
-    expect(qoderEncodeBody("hello")).toBe("q$FruHPH");
+    expect(enc("hello")).toBe("q$FruHPH");
   });
 });

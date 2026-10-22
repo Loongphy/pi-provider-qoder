@@ -5,13 +5,14 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type AssistantMessageEventStream,
+  type Context,
   clampThinkingLevel,
-  getCurrentSystemPrompt,
-  getCurrentTools,
+  type Message,
   type Model,
   type SimpleStreamOptions,
   type TextContent,
   type ThinkingContent,
+  type Tool,
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
@@ -27,7 +28,7 @@ import {
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "./models.js";
 import { getCachedCredentials } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
-import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
+import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 import { clearQueueStatus, qoderLog, reportQueueStatus } from "./ui.js";
 
@@ -38,6 +39,31 @@ interface ToolCallState {
   emittedStart?: boolean;
   emittedEnd?: boolean;
   contentIndex: number;
+}
+
+/**
+ * Parse the arguments the gateway streamed for one tool call, strictly.
+ *
+ * Truncated or malformed JSON used to fall back to `{}` and the call still ran
+ * — a `bash` with no command, a write with no path. Executing a call the model
+ * never actually wrote is worse than failing the turn, so this throws instead,
+ * and the outer handler reports the turn as an error.
+ */
+function parseToolCallArguments(raw: string): ToolCall["arguments"] {
+  let args: unknown = {};
+  if (raw.length > 0) {
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      // The parser's own message is deliberately not carried over: undici and
+      // V8 both quote the offending input, which can contain argument contents.
+      throw new Error(`Invalid or incomplete tool-call JSON (characters=${raw.length})`);
+    }
+  }
+  if (args === null || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error(`Non-object tool-call arguments (characters=${raw.length})`);
+  }
+  return args as ToolCall["arguments"];
 }
 
 function stableHash(prefix: string, ...inputs: string[]): string {
@@ -519,9 +545,88 @@ function qoderStreamFlushMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.min(parsed, 1000) : 40;
 }
 
+/**
+ * The pi-ai transcript helpers, feature-detected at runtime instead of named
+ * imported. Every member is optional because pi-ai <=0.85 does not export them
+ * at all, and a named import of a 0.86-only export would throw at module-load
+ * time there. Reading them off the namespace (`PiAi`) is deliberate.
+ */
+type TranscriptHelpers = Partial<
+  Pick<
+    typeof PiAi,
+    | "collapseSystemMessages"
+    | "getCurrentTools"
+    | "getInitialSystemMessage"
+    | "getSystemMessageText"
+    | "withoutInitialSystemMessage"
+  >
+>;
+
+/**
+ * Resolve the messages, system-prompt text and tools for the Qoder request from
+ * EITHER pi-ai provider contract:
+ *
+ *  - pi-ai >=0.86 hands providers a `TranscriptContext` (`{ messages }` only):
+ *    `normalizeContext()` folds the prompt and the tool declarations into the
+ *    transcript's leading system message, so the legacy top-level
+ *    `context.systemPrompt` / `context.tools` are undefined. Recover them from
+ *    the transcript, and drop the leading system message from the conversation
+ *    (`reqBody` re-injects `systemText` as its own role:system entry, because
+ *    Qoder ignores the top-level `system` field).
+ *  - pi-ai <=0.85 hands providers a flat `Context` with top-level `systemPrompt`
+ *    / `tools` and no transcript helpers at all.
+ *  - Some >=0.86 hosts hand providers a flat `Context` anyway while still
+ *    exporting the transcript toolkit to legacy extensions (omp 18.12.x does).
+ *    The leading system message is the only proof that this host actually
+ *    folded the prompt and tools into the transcript: without it the helpers
+ *    replay nothing, so resolving from the transcript would send `tools: []`
+ *    and silently drop the whole tool-call protocol.
+ *
+ * The FULL toolkit is required before taking the transcript path: if any
+ * helper is missing we cannot faithfully reconstruct prompt and tools, and the
+ * flat fields are the safe answer.
+ */
+export function resolveRequestContext(
+  piAi: TranscriptHelpers,
+  context: Context,
+): { messages: Message[]; systemText: string; tools: Tool[] } {
+  const {
+    collapseSystemMessages,
+    getCurrentTools,
+    getInitialSystemMessage,
+    getSystemMessageText,
+    withoutInitialSystemMessage,
+  } = piAi;
+
+  const hasTranscript =
+    typeof collapseSystemMessages === "function" &&
+    typeof getCurrentTools === "function" &&
+    typeof getInitialSystemMessage === "function" &&
+    typeof getSystemMessageText === "function" &&
+    typeof withoutInitialSystemMessage === "function";
+
+  const flat = (): { messages: Message[]; systemText: string; tools: Tool[] } => ({
+    messages: context.messages,
+    systemText: userTextOf(context.systemPrompt ?? ""),
+    tools: context.tools ?? [],
+  });
+
+  if (!hasTranscript) return flat();
+
+  const transcriptMessages = collapseSystemMessages(context as unknown as TranscriptContext).messages;
+  const initialSystem = getInitialSystemMessage(transcriptMessages);
+  if (!initialSystem) return flat();
+
+  return {
+    messages: withoutInitialSystemMessage(transcriptMessages),
+    systemText: getSystemMessageText(initialSystem),
+    tools: getCurrentTools(transcriptMessages),
+  };
+}
+
 export function streamQoder(
   model: Model<Api>,
-  context: TranscriptContext,
+  context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
@@ -550,6 +655,15 @@ export function streamQoder(
   // window, so pi rebuilds/renders the streaming message on its own frame
   // budget rather than on every SSE envelope. See createQoderDeltaEmitter.
   const emitter = createQoderDeltaEmitter(stream, qoderStreamFlushMs());
+
+  /**
+   * The response body of the attempt in flight. An error thrown out of the read
+   * loop — a gateway 4xx, malformed tool-call arguments — used to leave it
+   * unread, and undici holds a connection open for a body nobody will consume,
+   * so the process could not exit after a failed turn. Declared outside the
+   * async body so the error handler can see it.
+   */
+  let activeReader: { cancel(): Promise<void> } | undefined;
 
   (async () => {
     try {
@@ -586,11 +700,12 @@ export function streamQoder(
 
       const isReasoning = !!modelConfig.is_reasoning;
 
-      const normalizedMessages = transformMessagesForQoder(context.messages);
-      // TranscriptContext: the prompt lives in the transcript's system
-      // messages; transformMessagesForQoder drops them, so it is re-attached
-      // below as the leading role:system entry.
-      const systemText = getCurrentSystemPrompt(context.messages);
+      const requestContext = resolveRequestContext(PiAi, context);
+      const normalizedMessages = transformMessagesForQoder(requestContext.messages);
+      // resolveRequestContext already lifted the prompt out of the transcript and
+      // dropped the leading system message; Qoder ignores the top-level `system`
+      // field, so it is re-injected below as a leading role:system message.
+      const systemText = requestContext.systemText;
 
       let lastUserText = "";
       for (let i = normalizedMessages.length - 1; i >= 0; i--) {
@@ -624,7 +739,7 @@ export function streamQoder(
         maxTokens = options.maxTokens;
       }
 
-      const currentToolDefs = getCurrentTools(context.messages);
+      const currentToolDefs = requestContext.tools;
       const toolsRaw = currentToolDefs.length > 0 ? transformTools(currentToolDefs) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
 
@@ -643,7 +758,26 @@ export function streamQoder(
       // map to the upstream effort name. clampThinkingLevel returns "off" when
       // the level is unsupported or the user disabled thinking.
       const requestedLevel = options?.reasoning;
-      const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
+
+      // Normalize every host's "thinking off" signal into one flag. pi and OMP
+      // both omit `reasoning` (level "off" resolves to undefined), OMP's fork
+      // additionally sets `disableReasoning` / `forceReasoningOff`, and older
+      // hosts send `false` / `"off"`. When off, clamping must be skipped: our
+      // thinkingLevelMap pins `off` to null for reasoning models, and
+      // clampThinkingLevel walks upward from `off`, so it would clamp the
+      // request back UP to a concrete level and silently re-enable thinking.
+      const extOptions = options as
+        | (SimpleStreamOptions & { disableReasoning?: boolean; forceReasoningOff?: boolean })
+        | undefined;
+      const explicitlyOff =
+        extOptions?.disableReasoning === true ||
+        extOptions?.forceReasoningOff === true ||
+        (requestedLevel as unknown) === false ||
+        (requestedLevel as unknown) === "off";
+
+      // undefined here means "disable thinking"; the else branch below turns
+      // that into the wire signals.
+      const clamped = !explicitlyOff && requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
       const reasoningLevel = clamped === "off" ? undefined : clamped;
       const parameters: Record<string, unknown> = { max_tokens: maxTokens };
       if (reasoningLevel) {
@@ -660,9 +794,23 @@ export function streamQoder(
           parameters.reasoning_effort = effort;
         }
       } else {
-        // No reasoning level selected (or clamped to off): explicitly disable
-        // thinking so the model does not reason by default.
+        // Disable thinking with the three signals qodercli sends together.
+        // `enable_thinking: false` alone is not enough: while model_config
+        // reports `is_reasoning: true` the gateway still routes the model as
+        // reasoning-enabled (see the is_reasoning flip below).
         parameters.enable_thinking = false;
+        // Exception: a catalog that positively shows no `disabled` branch
+        // (effort-based thinking_config without it, or thinkingLevelMap pinning
+        // `off` to null) rejects `reasoning_effort: "none"` with a 400 — Sonus:
+        // "Unsupported value: 'none'". A non-reasoning model has no thinking to
+        // turn off either, and its catalog gives no signal, so it must not get
+        // the field either way.
+        const thinkingConfig = modelConfig?.thinking_config;
+        const lacksDisabledBranch =
+          (thinkingConfig?.enabled?.efforts && !thinkingConfig.disabled) || model.thinkingLevelMap?.off === null;
+        if (!lacksDisabledBranch && isReasoning) {
+          parameters.reasoning_effort = "none";
+        }
       }
 
       const reqBody: Record<string, unknown> = {
@@ -700,14 +848,14 @@ export function streamQoder(
             context: [],
             modelConfig: {
               key: qoderModel,
-              is_reasoning: isReasoning,
+              is_reasoning: reasoningLevel ? isReasoning : false,
             },
             originalContent: lastUserText,
           },
           features: [],
           text: lastUserText,
         },
-        model_config: modelConfig,
+        model_config: reasoningLevel ? modelConfig : { ...modelConfig, is_reasoning: false },
         business: {
           product: "cli",
           version: "1.0.0",
@@ -734,7 +882,7 @@ export function streamQoder(
        * every HTTP attempt, so a request that waited 30s is signed at send time.
        */
       const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-      const encodedBytes = Buffer.from(qoderEncodeBody(bodyBytes), "utf8");
+      const encodedBytes = qoderEncodeBody(bodyBytes);
       const signAttempt = () => buildAuthHeaders(encodedBytes, chatURL, cosyCreds);
 
       const modelSource = modelConfig.source || "system";
@@ -961,9 +1109,14 @@ export function streamQoder(
       const decoder = new TextDecoder();
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;
+      let rawReasoningTail = "";
       const toolCallsState: ToolCallState[] = [];
 
-      const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
+      // Same signal the request body was keyed off: the parser only goes away
+      // when the host EXPLICITLY turned thinking off, so a model that simply
+      // does not advertise it still has its stray in-band <thinking> tags
+      // stripped out of the text.
+      const thinkingEnabled = !explicitlyOff;
       const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, emitter) : null;
 
       do {
@@ -1000,6 +1153,7 @@ export function streamQoder(
 
         const reader = response.body?.getReader();
         if (!reader) throw new Error("No response body");
+        activeReader = reader;
         let buffer = "";
 
         // Set as soon as the stream itself tells us it is over (`[DONE]`) or
@@ -1046,8 +1200,13 @@ export function streamQoder(
 
             const dataStr = line.substring(5).trim();
             if (dataStr === "[DONE]") {
+              // Break the READ loop, not just the line loop: Qoder's gateway
+              // keeps the HTTP body open after the sentinel, so going back to
+              // reader.read() hung until the server or the OS eventually closed
+              // the socket. Everything was already streamed; the turn just
+              // looked stuck, with no error.
               bodySpent = true;
-              break;
+              break readLoop;
             }
 
             try {
@@ -1080,9 +1239,13 @@ export function streamQoder(
               const innerStr = envelope.body;
               // Qoder wraps the terminator in an envelope (`body:"[DONE]"`), so
               // the `dataStr === "[DONE]"` test above never matches it: the
-              // inner body is what says the stream is over.
-              if (innerStr === "[DONE]") bodySpent = true;
-              if (!innerStr || innerStr === "[DONE]") continue;
+              // inner body is what says the stream is over. Same handling as
+              // the bare sentinel — the reply is complete, stop reading.
+              if (innerStr === "[DONE]") {
+                bodySpent = true;
+                break readLoop;
+              }
+              if (!innerStr) continue;
 
               const inner = JSON.parse(innerStr);
               if (inner.id) output.responseId = inner.id as string;
@@ -1128,7 +1291,12 @@ export function streamQoder(
                     // `</thinking>` closer landing in the content stream). Strip
                     // tag artifacts so the thinking block stays clean, matching
                     // the SDK's ContentBlock model.
-                    const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+                    // The degenerate-turn check below reads the RAW reasoning
+                    // channel: the stripped chunk no longer carries the markup it
+                    // looks for. Only the tail matters, so this stays bounded
+                    // instead of growing with the reply.
+                    rawReasoningTail = (rawReasoningTail + delta.reasoning_content).slice(-512);
+                    const reasoningChunk = stripDsmlResidue(stripThinkingTags(delta.reasoning_content));
                     if (reasoningChunk) {
                       if (thinkingBlockIndex === -1) {
                         thinkingBlockIndex = output.content.length;
@@ -1254,11 +1422,16 @@ export function streamQoder(
           }
         }
 
-        // Hand the socket back before re-submitting: undici will not pool a
-        // connection whose body was never drained, and a queued gateway usually
-        // closes it right after the notice anyway. A body that already errored
-        // makes cancel() reject, which is expected here.
-        if (retryQueued) await reader.cancel().catch(() => {});
+        // Hand the socket back as soon as the reply is over. Left alone, the
+        // body stays open until the server times it out — and undici will not
+        // pool a connection that was never drained. On a queue retry this also
+        // releases the connection before the re-submit, and a queued gateway
+        // usually closes it right after the notice anyway. A body that already
+        // errored makes cancel() reject, which is expected here.
+        if (bodySpent) {
+          await reader.cancel().catch(() => {});
+          activeReader = undefined;
+        }
       } while (retryQueued);
 
       if (thinkingParser) {
@@ -1278,10 +1451,7 @@ export function streamQoder(
       for (const state of toolCallsState) {
         if (state?.emittedStart && !state.emittedEnd) {
           state.emittedEnd = true;
-          let args = {};
-          try {
-            args = JSON.parse(state.arguments || "{}");
-          } catch {}
+          const args = parseToolCallArguments(state.arguments);
           const block = output.content[state.contentIndex] as ToolCall;
           block.arguments = args;
           emitter.push({
@@ -1304,6 +1474,20 @@ export function streamQoder(
       if (toolCallsState.some((state) => state?.emittedStart)) {
         output.stopReason = "toolUse";
       }
+      // A turn the gateway stripped the tool call out of has no text and no tool
+      // call, so `stop` reads as a finished task: the agent loop ends the turn
+      // and the work dies with no error to retry. Report it instead.
+      if (isDegenerateDsmlTurn(output, rawReasoningTail)) {
+        output.stopReason = "error";
+        // "server error" is deliberate: pi-ai classifies an assistant error by
+        // matching its message (RETRYABLE_PROVIDER_ERROR_PATTERN), and that
+        // phrase is what makes the turn retryable instead of a dead end.
+        output.errorMessage =
+          "Qoder server error: degenerate model output (unparseable DSML tool-call markup, no tool call executed)";
+        emitter.push({ type: "error", reason: "error", error: output });
+        stream.end();
+        return;
+      }
       // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
       // Never overwrite a meaningful finish_reason ("length", "content_filter",
       // ...) with "stop".
@@ -1315,6 +1499,9 @@ export function streamQoder(
       stream.end();
     } catch (e: unknown) {
       clearQoderQueueStatus();
+      // Release the attempt's body before reporting the turn, or the connection
+      // stays open for a body nobody will read.
+      if (activeReader) await activeReader.cancel().catch(() => {});
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       emitter.push({ type: "error", reason: output.stopReason, error: output });

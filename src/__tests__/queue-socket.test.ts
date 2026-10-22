@@ -9,7 +9,6 @@
  * loopback HTTP with the stock fetch.
  */
 import http from "node:http";
-import { normalizeContext } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
@@ -18,6 +17,7 @@ import type {
   Model,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { streamQoder } from "../stream.js";
 
@@ -66,7 +66,11 @@ function makeModel(): Model<Api> {
 }
 
 function makeContext(): TranscriptContext {
-  return normalizeContext({ systemPrompt: "test", messages: [{ role: "user", content: "hi", timestamp: 0 }], tools: [] });
+  return normalizeContext({
+    systemPrompt: "test",
+    messages: [{ role: "user", content: "hi", timestamp: 0 }],
+    tools: [],
+  });
 }
 
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {

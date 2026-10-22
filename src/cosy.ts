@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getGatewayCosyVersion } from "./cosy-version.js";
 
 const qoderRSAPublicKey = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
@@ -10,9 +11,12 @@ MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc
 XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----`;
 
-// Keep the COSY client identity aligned with the current Qoder CLI catalog
-// protocol. Older values cause the model endpoint to return a reduced list.
-const QoderIDEVersion = "1.1.3";
+// The COSY client identity must track the current Qoder CLI release: older
+// values make the model endpoint return a reduced list. There is no constant
+// for it here on purpose: the value is resolved at sign time by cosy-version.ts
+// (which caches the newest published CLI tag and never downgrades), and
+// BUNDLED_GATEWAY_COSY_VERSION there is only the offline fallback this package
+// ships with.
 const QoderClientType = "5";
 const QoderDataPolicy = "disagree";
 const QoderLoginVersion = "v2";
@@ -184,8 +188,15 @@ function computeSigPath(urlStr: string): string {
   return sigPath;
 }
 
+function getHomeDir(): string {
+  // Prefer process.env.HOME so tests can isolate caches (same pattern as
+  // models.ts and cosy-version.ts, which must resolve the same home).
+  return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+
 export function getMachineId(): string {
-  const paths = [join(homedir(), ".qoder", ".auth", "machine_id"), join(homedir(), ".pi", "agent", "qoder-machine-id")];
+  const home = getHomeDir();
+  const paths = [join(home, ".qoder", ".auth", "machine_id"), join(home, ".pi", "agent", "qoder-machine-id")];
   for (const p of paths) {
     if (existsSync(p)) {
       try {
@@ -229,27 +240,39 @@ export function buildAuthHeaders(
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const requestId = crypto.randomUUID();
+  const cosyVersion = getGatewayCosyVersion();
 
   const cosyPayload: CosyPayload = {
     version: "v1",
     requestId,
     info: infoB64,
-    cosyVersion: QoderIDEVersion,
+    cosyVersion,
     ideVersion: "",
   };
 
   const payloadB64 = Buffer.from(JSON.stringify(cosyPayload)).toString("base64");
   const sigPath = computeSigPath(requestURL);
 
-  const bodyStr = body ? (Buffer.isBuffer(body) ? body.toString("utf8") : body) : "";
-  const sigInput = `${payloadB64}\n${cosyKey}\n${timestamp}\n${bodyStr}\n${sigPath}`;
-  const sig = crypto.createHash("md5").update(sigInput).digest("hex");
-
-  const bodyHash = crypto
+  // Feed MD5 in the same byte order as the legacy template string
+  // payloadB64 + "\n" + cosyKey + "\n" + timestamp + "\n" + body + "\n" + sigPath
+  // without materializing a full-body string copy (equivalence is pinned by
+  // tests): a chat body is multi-megabyte and this runs once per request.
+  const bodyBytes = body ? (Buffer.isBuffer(body) ? body : Buffer.from(body)) : Buffer.alloc(0);
+  const sig = crypto
     .createHash("md5")
-    .update(body || "")
+    .update(payloadB64)
+    .update("\n")
+    .update(cosyKey)
+    .update("\n")
+    .update(timestamp)
+    .update("\n")
+    .update(bodyBytes)
+    .update("\n")
+    .update(sigPath)
     .digest("hex");
-  const bodyLen = body ? (Buffer.isBuffer(body) ? body.length : Buffer.from(body).length).toString() : "0";
+
+  const bodyHash = crypto.createHash("md5").update(bodyBytes).digest("hex");
+  const bodyLen = bodyBytes.length.toString();
 
   const machineID = creds.machineID || getMachineId();
 
@@ -258,7 +281,7 @@ export function buildAuthHeaders(
     "Cosy-Key": cosyKey,
     "Cosy-User": creds.userID,
     "Cosy-Date": timestamp,
-    "Cosy-Version": QoderIDEVersion,
+    "Cosy-Version": cosyVersion,
     "Cosy-Machineid": machineID,
     "Cosy-Machinetoken": machineID,
     "Cosy-Machinetype": QoderMachineTypeMagic,

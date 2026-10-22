@@ -3,10 +3,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateQoderModelsCache } from "../models.js";
-import { autoLoginQoderFromEnvironment, getCachedCredentials, getQoderPatForMode } from "../oauth.js";
+import {
+  autoLoginQoderFromEnvironment,
+  clearQoderAuthMemCache,
+  getCachedCredentials,
+  getQoderPatForMode,
+} from "../oauth.js";
 import { credentialsFromPat } from "../pat.js";
 
-const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
+const AUTH_FILE = join(process.env.HOME || process.env.USERPROFILE || homedir(), ".pi", "agent", "auth.json");
 
 vi.mock("../pat.js", () => ({
   credentialsFromPat: vi.fn().mockResolvedValue({
@@ -38,6 +43,9 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env = { ...originalEnv };
+    // auth.json is the real one from ~/.pi, so the memoized parse must not
+    // survive a test that replaces the file behind oauth.ts's back.
+    clearQoderAuthMemCache();
     originalAuth = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, "utf8") : undefined;
   });
 
@@ -45,6 +53,7 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
     process.env = originalEnv;
     if (originalAuth === undefined) rmSync(AUTH_FILE, { force: true });
     else writeFileSync(AUTH_FILE, originalAuth, "utf8");
+    clearQoderAuthMemCache();
   });
 
   it("extracts PAT correctly from env for global and CN mode", () => {
@@ -86,5 +95,17 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
       "test@example.com",
       "global",
     );
+  });
+
+  it("serves just-saved credentials from memory instead of re-reading disk", async () => {
+    process.env.QODER_PERSONAL_ACCESS_TOKEN = "pt-global-memoized";
+
+    await autoLoginQoderFromEnvironment("qoder-test-provider", "global");
+    expect(getCachedCredentials("mock-access-token", "qoder-test-provider")?.userID).toBe("mock-user-123");
+
+    // Delete the file behind oauth.ts's back: the identity saved this turn must
+    // still be served, which is the per-turn disk read this cache removes.
+    rmSync(AUTH_FILE, { force: true });
+    expect(getCachedCredentials("mock-access-token", "qoder-test-provider")?.access).toBe("mock-access-token");
   });
 });

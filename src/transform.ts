@@ -8,6 +8,8 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { stripDsmlResidue, stripThinkingTags } from "./thinking-parser.js";
+import { createQoderToolCallIdMapper } from "./tool-call-id.js";
 
 /** OpenAI-style tool definition sent to the Qoder API. */
 interface QoderTool {
@@ -34,6 +36,7 @@ type QoderContent = string | Array<QoderTextPart | QoderImagePart>;
 interface QoderMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: QoderContent | null;
+  reasoning_content?: string;
   tool_calls?: QoderToolCall[];
   tool_call_id?: string;
 }
@@ -72,16 +75,48 @@ export function transformTools(tools: Tool[]): QoderTool[] {
 export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
   const normalizedMessages: QoderMessage[] = [];
 
-  for (const msg of messages) {
+  // Qoder rejects tool call IDs outside `^[a-zA-Z0-9_-]{1,64}$`; pi's OpenAI
+  // Responses adapter produces internal IDs containing `|`. Rewrite them for
+  // the wire only. droppedToolCallIds below intentionally keeps comparing raw
+  // internal IDs: the drop filter runs before mapping on both sides.
+  const mapToolCallId = createQoderToolCallIdMapper();
+
+  // Dropping an assistant turn (below) also invalidates its tool calls: the
+  // result that follows would refer to a tool_calls entry that is no longer in
+  // the request, and upstreams reject that with "tool must follow a message
+  // with tool_calls".
+  const droppedToolCallIds = new Set<string>();
+  // A name-only tool call carries no ID at all, and every such call shares that
+  // one empty ID, so the set above cannot single out one turn. Its results are
+  // dropped only while the scan is still inside the run that follows the
+  // skipped turn.
+  let droppedTurnHasUnnamedCall = false;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
     // Skip error or aborted messages
     if (
       msg.role === "assistant" &&
       ((msg as AssistantMessage).stopReason === "error" || (msg as AssistantMessage).stopReason === "aborted")
     ) {
+      const am = msg as AssistantMessage;
+      let unnamedCall = false;
+      if (Array.isArray(am.content)) {
+        for (const block of am.content) {
+          if (block.type === "toolCall") {
+            const id = (block as ToolCall).id;
+            if (id) droppedToolCallIds.add(id);
+            else unnamedCall = true;
+          }
+        }
+      }
+      droppedTurnHasUnnamedCall = unnamedCall;
       continue;
     }
 
     if (msg.role === "user") {
+      droppedTurnHasUnnamedCall = false;
       let content: QoderContent = "";
       if (typeof msg.content === "string") {
         content = msg.content;
@@ -115,7 +150,9 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       });
     } else if (msg.role === "assistant") {
       const am = msg as AssistantMessage;
+      droppedTurnHasUnnamedCall = false;
       let content = "";
+      let reasoningContent = "";
       const toolCalls: QoderToolCall[] = [];
 
       if (Array.isArray(am.content)) {
@@ -123,12 +160,16 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           if (block.type === "text") {
             content += (block as TextContent).text;
           } else if (block.type === "thinking") {
-            // Include thinking tags if reasoning is on
-            content += `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n`;
+            // Replay reasoning out-of-band. Qoder returns it through
+            // reasoning_content; folding it back into visible content lets the
+            // model answer its own thinking on the next turn, and the stored
+            // text can still carry markup the gateway leaked into the reasoning
+            // channel.
+            reasoningContent += stripDsmlResidue(stripThinkingTags((block as ThinkingContent).thinking));
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             toolCalls.push({
-              id: tc.id,
+              id: mapToolCallId(tc.id),
               type: "function",
               function: {
                 name: tc.name,
@@ -144,50 +185,70 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       // Qoder's gateway drops assistant messages whose content is null, which
       // orphans the following tool_result and makes dmodel/ultimate upstreams
       // reject the request ("tool must follow a message with tool_calls").
-      // When an assistant turn has tool calls but no text/thinking, inject a
-      // single-space placeholder so the gateway keeps the message.
+      // When an assistant turn has tool calls or reasoning but no visible
+      // text, inject a placeholder so the gateway keeps the message and its
+      // reasoning history.
       const mapped: QoderMessage = {
         role: "assistant",
-        content: content || (toolCalls.length > 0 ? " " : null),
+        content: content || (toolCalls.length > 0 || reasoningContent ? " " : null),
       };
+      if (reasoningContent) {
+        mapped.reasoning_content = reasoningContent;
+      }
       if (toolCalls.length > 0) {
         mapped.tool_calls = toolCalls;
       }
       normalizedMessages.push(mapped);
     } else if (msg.role === "toolResult") {
-      const tr = msg as ToolResultMessage;
-      normalizedMessages.push({
-        role: "tool",
-        tool_call_id: tr.toolCallId,
-        content: getContentText(tr),
-      });
-
-      // A tool result may carry images — pi's `read` tool returns a text note
-      // plus an `image` block for png/jpg/gif/webp/bmp, and screenshot tools do
-      // the same. getContentText() maps every non-text block to "", so those
-      // images were dropped silently: the TUI rendered the picture while the
-      // model received only "Read image file [image/png]" and reported that it
-      // could not see images.
+      // Consume the whole run of consecutive tool results before emitting the
+      // images they returned. A `tool` message can only carry text, so tool
+      // images have to ride on a following `user` message; emitting one per
+      // result would interrupt the tool replies, and upstreams reject an
+      // assistant `tool_calls` turn whose replies are split ("insufficient tool
+      // messages following tool_calls message"). Instead emit every `tool`
+      // reply first, collect the images, and append a single `user` message
+      // after the run.
       //
-      // The OpenAI-shaped `tool` role has nowhere to put them — its content is
-      // a plain string — so they follow as a separate user message, the same
-      // shape the user branch above already builds. The leading label keeps the
-      // model from reading a bare image as something the human just sent.
-      const images = getContentImages(tr);
-      if (images.length > 0) {
+      // pi's `read` tool returns a text note plus an `image` block for
+      // png/jpg/gif/webp/bmp, and screenshot tools do the same. getContentText()
+      // maps every non-text block to "", so before this the images were dropped
+      // silently: the TUI rendered the picture while the model received only
+      // "Read image file [image/png]" and reported that it could not see
+      // images. The leading label keeps the model from reading a bare image as
+      // something the human just sent.
+      const imageBlocks: QoderImagePart[] = [];
+      let j = i;
+      for (; j < messages.length; j++) {
+        const trMsg = messages[j];
+        if (trMsg.role !== "toolResult") break;
+        const tr = trMsg as ToolResultMessage;
+        // Drop results of an assistant turn that was skipped above, otherwise
+        // they refer to a tool_calls entry no longer in the request.
+        if (droppedToolCallIds.has(tr.toolCallId)) continue;
+        if (!tr.toolCallId && droppedTurnHasUnnamedCall) continue;
+        normalizedMessages.push({
+          role: "tool",
+          tool_call_id: mapToolCallId(tr.toolCallId),
+          content: getContentText(tr),
+        });
+        for (const img of getContentImages(tr)) {
+          imageBlocks.push({
+            type: "image_url",
+            image_url: { url: `data:${img.mimeType};base64,${img.data}` },
+          });
+        }
+      }
+      i = j - 1;
+
+      if (imageBlocks.length > 0) {
         normalizedMessages.push({
           role: "user",
           content: [
             {
               type: "text",
-              text: `[${images.length} image${images.length === 1 ? "" : "s"} returned by the previous tool call]`,
+              text: `[${imageBlocks.length} image${imageBlocks.length === 1 ? "" : "s"} returned by the previous tool call]`,
             },
-            ...images.map(
-              (img): QoderImagePart => ({
-                type: "image_url",
-                image_url: { url: `data:${img.mimeType};base64,${img.data}` },
-              }),
-            ),
+            ...imageBlocks,
           ],
         });
       }

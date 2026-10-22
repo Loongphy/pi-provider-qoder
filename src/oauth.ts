@@ -14,7 +14,47 @@ export interface QoderCredentials extends OAuthCredentials {
   machineID: string;
 }
 
-const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
+function getHomeDir(): string {
+  // Prefer process.env.HOME so tests can isolate stores (same pattern as
+  // models.ts and cosy.ts, which must resolve the same home).
+  return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+
+function getAuthFilePath(): string {
+  return join(getHomeDir(), ".pi", "agent", "auth.json");
+}
+
+/**
+ * Memoized parse of auth.json; invalidated on save. undefined = not loaded.
+ * pi's credentials are read on every turn to resolve the COSY identity, and
+ * the file grows with every provider pi has ever logged into.
+ */
+let authFileMem: { path: string; data: Record<string, unknown> } | null | undefined;
+
+/** Clear process-memory auth caches (used by tests that mutate auth.json). */
+export function clearQoderAuthMemCache(): void {
+  authFileMem = undefined;
+}
+
+function readAuthFileCached(): Record<string, unknown> | null {
+  const authPath = getAuthFilePath();
+  if (authFileMem !== undefined) {
+    if (authFileMem === null) return null;
+    if (authFileMem.path === authPath) return authFileMem.data;
+  }
+  if (!existsSync(authPath)) {
+    authFileMem = null;
+    return null;
+  }
+  try {
+    const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+    authFileMem = { path: authPath, data };
+    return data;
+  } catch {
+    authFileMem = null;
+    return null;
+  }
+}
 
 /** Return the PAT exposed through the environment for a provider mode. */
 export function getQoderPatForMode(mode: string): string {
@@ -26,18 +66,18 @@ export function getQoderPatForMode(mode: string): string {
 
 function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredentials): void {
   try {
-    const dir = dirname(AUTH_FILE);
+    const authPath = getAuthFilePath();
+    const dir = dirname(authPath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    let auth: Record<string, unknown> = {};
-    if (existsSync(AUTH_FILE)) {
-      try {
-        auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-      } catch {}
-    }
+    const existing = readAuthFileCached();
+    const auth: Record<string, unknown> = existing ? { ...existing } : {};
     auth[providerID] = { type: "oauth", ...credentials };
-    writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    // Keep the memoized copy in sync with what was just written, otherwise the
+    // next read would serve the pre-save credentials from memory.
+    authFileMem = { path: authPath, data: auth };
   } catch (err) {
     console.error(`[pi-provider-qoder] Failed to write auth storage for ${providerID}:`, err);
   }
@@ -71,14 +111,11 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: st
  * This is best-effort and falls back to null so callers can use placeholders.
  */
 export function getCachedCredentials(_accessToken: string, providerID = "qoder"): QoderCredentials | null {
-  if (existsSync(AUTH_FILE)) {
-    try {
-      const auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-      const creds = auth?.[providerID] || (providerID === "qoder" ? auth?.qoder : null);
-      if (creds?.userID || creds?.access) {
-        return creds as QoderCredentials;
-      }
-    } catch {}
+  const auth = readAuthFileCached();
+  if (!auth) return null;
+  const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
+  if (creds?.userID || creds?.access) {
+    return creds;
   }
   return null;
 }

@@ -1,6 +1,6 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { stripThinkingTags, ThinkingTagParser } from "../thinking-parser.js";
+import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "../thinking-parser.js";
 
 function createMockStream() {
   const events: AssistantMessageEvent[] = [];
@@ -34,6 +34,60 @@ function createOutput(): AssistantMessage {
     timestamp: Date.now(),
   } as AssistantMessage;
 }
+
+// Fixtures for the markup Qoder's gateway leaks when it fails to turn a
+// model's tool-call intent into `tool_calls`. The opening angle bracket is
+// written as an escape so these stay single-line string literals.
+const INVOKE_CLOSE = "\u003C/invoke>";
+const PARAM_CLOSE = "\u003C/parameter>";
+const FUNCTION_CALL_CLOSE = "\u003C/function_call>";
+const DSML_CLOSE = "\u003C/｜DSML｜invoke｜>";
+
+describe("stripDsmlResidue", () => {
+  it("removes every leaked tool-call tag form", () => {
+    const leaked = `Calling it now.${INVOKE_CLOSE}${PARAM_CLOSE}${FUNCTION_CALL_CLOSE}${DSML_CLOSE}`;
+    expect(stripDsmlResidue(leaked)).toBe("Calling it now.");
+  });
+
+  it("collapses the blank lines the markup leaves behind", () => {
+    expect(stripDsmlResidue(`a\n\n${INVOKE_CLOSE}\n\nb`)).toBe("a\n\nb");
+  });
+
+  it("leaves prose untouched", () => {
+    expect(stripDsmlResidue("I should invoke the tool later.")).toBe("I should invoke the tool later.");
+  });
+
+  it("survives the repeated-tag burst seen in the wild", () => {
+    expect(stripDsmlResidue(INVOKE_CLOSE.repeat(40))).toBe("");
+  });
+});
+
+describe("isDegenerateDsmlTurn", () => {
+  const turn = (blocks: Array<{ type: "text"; text: string }>, stopReason: AssistantMessage["stopReason"]) => {
+    const message = createOutput();
+    message.content = blocks;
+    message.stopReason = stopReason;
+    return message;
+  };
+
+  it("flags the no-text no-tool-call turn whose reasoning ends in leaked markup", () => {
+    expect(isDegenerateDsmlTurn(turn([], "stop"), `thinking${INVOKE_CLOSE}${PARAM_CLOSE}`)).toBe(true);
+  });
+
+  it("does not flag a single literal tag inside normal reasoning", () => {
+    expect(isDegenerateDsmlTurn(turn([], "stop"), `thinking ${INVOKE_CLOSE} then more prose`)).toBe(false);
+  });
+
+  it("never flags a turn that produced text", () => {
+    expect(
+      isDegenerateDsmlTurn(turn([{ type: "text", text: "an answer" }], "stop"), `x${INVOKE_CLOSE}${INVOKE_CLOSE}`),
+    ).toBe(false);
+  });
+
+  it("never flags a turn that did execute a tool call", () => {
+    expect(isDegenerateDsmlTurn(turn([], "toolUse"), `x${INVOKE_CLOSE}${INVOKE_CLOSE}`)).toBe(false);
+  });
+});
 
 describe("ThinkingTagParser", () => {
   let output: AssistantMessage;
